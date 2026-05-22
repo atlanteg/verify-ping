@@ -13,6 +13,7 @@ not corrupted or mixed up in transit.
 - Unique deterministic payload per ICMP request
 - SHA-256 payload verification for every reply
 - Regular `ping`-style options for count, interval, and payload size
+- Parallel measurement streams with separate ICMP identifiers
 - Reports lost requests, bad payloads, duplicates, and unexpected replies
 - No third-party Python dependencies
 
@@ -36,6 +37,21 @@ but with verified unique payloads:
 sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200
 ```
 
+Run four parallel streams:
+
+```sh
+sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200 -P 4
+```
+
+`--threads` is also accepted:
+
+```sh
+sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200 --threads 4
+```
+
+`-c` is the packet count per stream. For example, `-c 3000 -P 4` sends
+`12000` total ICMP echo requests.
+
 Print every verified reply:
 
 ```sh
@@ -54,7 +70,7 @@ A successful run ends like this:
 
 ```text
 --- 10.200.200.1 verified ping statistics ---
-sent=3000 verified=3000 lost=0 bad_payload=0 duplicates=0 unexpected=0
+streams=1 count_per_stream=3000 sent=3000 verified=3000 lost=0 bad_payload=0 duplicates=0 unexpected=0
 checked_payload=3.4MB elapsed=239.923s
 ```
 
@@ -66,4 +82,3 @@ reply payload does not match the request.
 
 The tool uses a raw ICMP socket, so `sudo` is normally required. The ICMP
 sequence number is 16-bit, so one run is limited to `65535` packets.
-

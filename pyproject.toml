@@ -1,6 +1,6 @@
 [project]
 name = "verify-ping"
-version = "0.1.0"
+version = "0.2.0"
 description = "ICMP echo tester with unique payload verification per packet"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -33,8 +33,8 @@ def expand(seed, size):
     return bytes(out[:size])
 
 
-def make_payload(size, ident, seq, index, send_ns, run_nonce):
-    prefix = MAGIC + struct.pack("!HHIQ16s", ident, seq, index, send_ns, run_nonce)
+def make_payload(size, ident, stream, seq, index, send_ns, run_nonce):
+    prefix = MAGIC + struct.pack("!HHHIQ16s", ident, stream, seq, index, send_ns, run_nonce)
     if size <= len(prefix):
         return prefix[:size]
     filler = expand(prefix, size - len(prefix))
@@ -78,9 +78,17 @@ def parse_args():
         description="ICMP echo tester with unique payload verification per packet."
     )
     parser.add_argument("host", help="IPv4 destination")
-    parser.add_argument("-c", "--count", type=int, default=3000, help="packet count")
+    parser.add_argument("-c", "--count", type=int, default=3000, help="packet count per stream")
     parser.add_argument("-i", "--interval", type=float, default=0.08, help="send interval in seconds")
     parser.add_argument("-s", "--size", type=int, default=1200, help="ICMP payload size in bytes")
+    parser.add_argument(
+        "-P",
+        "--parallel",
+        "--threads",
+        type=int,
+        default=1,
+        help="parallel measurement streams to run",
+    )
     parser.add_argument("-W", "--timeout", type=float, default=3.0, help="seconds to wait after last send")
     parser.add_argument("--progress", type=int, default=100, help="print progress every N verified replies")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
@@ -97,10 +105,13 @@ def main():
         raise SystemExit("interval must be non-negative")
     if args.size < 0:
         raise SystemExit("size must be non-negative")
+    if args.parallel < 1:
+        raise SystemExit("parallel must be positive")
+    if args.parallel > 65535:
+        raise SystemExit("parallel must be <= 65535 because ICMP identifiers are 16-bit")
 
     dest_ip = socket.gethostbyname(args.host)
-    ident = os.getpid() & 0xFFFF
-    run_nonce = os.urandom(16)
+    base_ident = os.getpid() & 0xFFFF
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
@@ -111,48 +122,105 @@ def main():
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
 
+    streams = []
+    used_idents = set()
+    started = time.monotonic()
+    for stream_no in range(1, args.parallel + 1):
+        ident = (base_ident + stream_no - 1) & 0xFFFF
+        if ident in used_idents:
+            raise SystemExit("parallel produced duplicate ICMP identifiers")
+        used_idents.add(ident)
+        streams.append(
+            {
+                "stream": stream_no,
+                "ident": ident,
+                "nonce": os.urandom(16),
+                "sent": 0,
+                "verified": 0,
+                "bad": 0,
+                "next_send": started,
+                "last_send": None,
+            }
+        )
+
+    streams_by_ident = {stream["ident"]: stream for stream in streams}
+    target_total = args.count * args.parallel
     pending = {}
     completed = {}
     bad = []
     unexpected = 0
     duplicates = 0
-    sent = 0
-    verified = 0
-    next_send = time.monotonic()
-    started = next_send
-    last_send = None
+    sent_total = 0
+    verified_total = 0
+
+    def ident_range():
+        if args.parallel == 1:
+            return f"0x{streams[0]['ident']:04x}"
+        if args.parallel <= 4:
+            return ", ".join(f"0x{stream['ident']:04x}" for stream in streams)
+        return f"0x{streams[0]['ident']:04x}..0x{streams[-1]['ident']:04x}"
 
     print(
-        f"verify_ping {dest_ip}: {args.count} packets, {args.size} data bytes, "
-        f"interval {args.interval}s, id 0x{ident:04x}"
+        f"verify_ping {dest_ip}: {args.count} packets/stream, {args.parallel} streams, "
+        f"{target_total} total packets, {args.size} data bytes, interval {args.interval}s, "
+        f"ids {ident_range()}"
     )
 
-    while sent < args.count or pending:
+    def send_one(stream):
+        nonlocal sent_total
+
+        seq = stream["sent"] + 1
+        send_ns = time.monotonic_ns()
+        payload = make_payload(
+            args.size,
+            stream["ident"],
+            stream["stream"],
+            seq,
+            seq,
+            send_ns,
+            stream["nonce"],
+        )
+        packet = make_packet(stream["ident"], seq, payload)
+        sock.sendto(packet, (dest_ip, 0))
+
+        sent_at = time.monotonic()
+        pending[(stream["ident"], seq)] = {
+            "stream": stream["stream"],
+            "index": seq,
+            "hash": hashlib.sha256(payload).digest(),
+            "size": len(payload),
+            "sent_at": sent_at,
+        }
+        stream["sent"] += 1
+        stream["last_send"] = sent_at
+        stream["next_send"] += args.interval
+        sent_total += 1
+
+    while sent_total < target_total or pending:
         now = time.monotonic()
 
-        while sent < args.count and now >= next_send:
-            seq = (sent + 1) & 0xFFFF
-            send_ns = time.monotonic_ns()
-            payload = make_payload(args.size, ident, seq, sent + 1, send_ns, run_nonce)
-            packet = make_packet(ident, seq, payload)
-            sock.sendto(packet, (dest_ip, 0))
+        sent_any = True
+        while sent_any:
+            sent_any = False
+            for stream in streams:
+                while stream["sent"] < args.count and now >= stream["next_send"]:
+                    send_one(stream)
+                    sent_any = True
+                    now = time.monotonic()
+                    if args.interval == 0:
+                        break
 
-            pending[seq] = {
-                "index": sent + 1,
-                "hash": hashlib.sha256(payload).digest(),
-                "size": len(payload),
-                "sent_at": time.monotonic(),
-            }
-            sent += 1
-            last_send = pending[seq]["sent_at"]
-            next_send += args.interval
-            now = time.monotonic()
+        pending_send_times = [
+            stream["next_send"] for stream in streams if stream["sent"] < args.count
+        ]
+        if pending_send_times:
+            wait_until_send = max(0.0, min(pending_send_times) - now)
+        else:
+            wait_until_send = args.timeout
 
-        wait_until_send = max(0.0, next_send - now) if sent < args.count else args.timeout
-        wait_until_timeout = args.timeout
-        if pending and last_send is not None and sent >= args.count:
-            wait_until_timeout = max(0.0, last_send + args.timeout - now)
-        timeout = min(wait_until_send, wait_until_timeout, 0.2)
+        timeout = min(wait_until_send, args.timeout, 0.2)
+        if timeout == 0 and pending:
+            timeout = 0.001
 
         events = selector.select(timeout)
         for _key, _mask in events:
@@ -166,13 +234,18 @@ def main():
                 if not parsed:
                     continue
                 typ, code, reply_ident, seq, payload = parsed
-                if typ != ICMP_ECHO_REPLY or code != 0 or reply_ident != ident:
+                if (
+                    typ != ICMP_ECHO_REPLY
+                    or code != 0
+                    or reply_ident not in streams_by_ident
+                ):
                     continue
 
-                rec = pending.get(seq)
+                key = (reply_ident, seq)
+                rec = pending.get(key)
                 digest = hashlib.sha256(payload).digest()
                 if rec is None:
-                    old = completed.get(seq)
+                    old = completed.get(key)
                     if old and old == digest:
                         duplicates += 1
                     else:
@@ -181,41 +254,80 @@ def main():
 
                 rtt_ms = (time.monotonic() - rec["sent_at"]) * 1000.0
                 if len(payload) != rec["size"] or digest != rec["hash"]:
-                    bad.append((rec["index"], seq, src[0], len(payload), rec["size"]))
-                    del pending[seq]
+                    streams_by_ident[reply_ident]["bad"] += 1
+                    bad.append(
+                        (
+                            rec["stream"],
+                            rec["index"],
+                            seq,
+                            src[0],
+                            len(payload),
+                            rec["size"],
+                        )
+                    )
+                    del pending[key]
                     continue
 
-                verified += 1
-                completed[seq] = digest
-                del pending[seq]
-                if args.verbose or (args.progress and verified % args.progress == 0):
-                    print(f"ok={verified}/{args.count} seq={seq} from={src[0]} rtt={rtt_ms:.3f} ms")
+                verified_total += 1
+                streams_by_ident[reply_ident]["verified"] += 1
+                completed[key] = digest
+                del pending[key]
+                if args.verbose or (args.progress and verified_total % args.progress == 0):
+                    print(
+                        f"ok={verified_total}/{target_total} stream={rec['stream']} "
+                        f"seq={seq} from={src[0]} rtt={rtt_ms:.3f} ms"
+                    )
 
-        if sent >= args.count and pending and last_send is not None:
-            if time.monotonic() - last_send >= args.timeout:
+        if sent_total >= target_total and pending:
+            last_sent_times = [
+                stream["last_send"] for stream in streams if stream["last_send"] is not None
+            ]
+            if last_sent_times and time.monotonic() - max(last_sent_times) >= args.timeout:
                 break
 
     elapsed = time.monotonic() - started
     lost = len(pending)
-    checked_bytes = verified * args.size
+    checked_bytes = verified_total * args.size
 
     print()
     print(f"--- {dest_ip} verified ping statistics ---")
-    print(f"sent={sent} verified={verified} lost={lost} bad_payload={len(bad)} duplicates={duplicates} unexpected={unexpected}")
+    print(
+        f"streams={args.parallel} count_per_stream={args.count} sent={sent_total} "
+        f"verified={verified_total} lost={lost} bad_payload={len(bad)} "
+        f"duplicates={duplicates} unexpected={unexpected}"
+    )
     print(f"checked_payload={fmt_bytes(checked_bytes)} elapsed={elapsed:.3f}s")
 
+    if args.parallel > 1:
+        pending_by_stream = {stream["stream"]: 0 for stream in streams}
+        for rec in pending.values():
+            pending_by_stream[rec["stream"]] += 1
+        for stream in streams:
+            print(
+                f"stream={stream['stream']} sent={stream['sent']} "
+                f"verified={stream['verified']} lost={pending_by_stream[stream['stream']]} "
+                f"bad_payload={stream['bad']}"
+            )
+
     if pending:
-        missed = ", ".join(str(pending[seq]["index"]) for seq in sorted(pending)[:20])
+        missed_items = sorted((rec["stream"], rec["index"]) for rec in pending.values())
+        if args.parallel == 1:
+            missed = ", ".join(str(index) for _stream, index in missed_items[:20])
+        else:
+            missed = ", ".join(f"{stream}:{index}" for stream, index in missed_items[:20])
         suffix = " ..." if len(pending) > 20 else ""
         print(f"missing request indexes: {missed}{suffix}")
 
     if bad:
-        for index, seq, src, got_size, expected_size in bad[:20]:
-            print(f"bad payload: index={index} seq={seq} from={src} got_size={got_size} expected_size={expected_size}")
+        for stream, index, seq, src, got_size, expected_size in bad[:20]:
+            print(
+                f"bad payload: stream={stream} index={index} seq={seq} from={src} "
+                f"got_size={got_size} expected_size={expected_size}"
+            )
         if len(bad) > 20:
             print(f"bad payload: ... {len(bad) - 20} more")
 
-    return 0 if sent == verified and not pending and not bad else 1
+    return 0 if sent_total == verified_total and not pending and not bad else 1
 
 
 if __name__ == "__main__":
