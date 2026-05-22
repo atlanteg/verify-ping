@@ -270,6 +270,12 @@ def fmt_bytes(value):
     return f"{value}B"
 
 
+def loss_percent(sent, lost):
+    if sent <= 0:
+        return 0.0
+    return lost * 100.0 / sent
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Payload-verifying ICMP/UDP/TCP echo tester."
@@ -410,7 +416,7 @@ def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates
     print(
         f"streams={args.parallel} count_per_stream={args.count} sent={sent_total} "
         f"verified={verified_total} lost={lost} bad_payload={len(bad)} "
-        f"duplicates={duplicates} unexpected={unexpected}"
+        f"loss={loss_percent(sent_total, lost):.3f}% duplicates={duplicates} unexpected={unexpected}"
     )
     print(f"checked_payload={fmt_bytes(checked_bytes)} elapsed={elapsed:.3f}s")
 
@@ -419,9 +425,11 @@ def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates
         for rec in pending.values():
             pending_by_stream[rec["stream"]] += 1
         for stream in streams:
+            stream_lost = pending_by_stream[stream["stream"]]
             print(
                 f"stream={stream['stream']} sent={stream['sent']} "
-                f"verified={stream['verified']} lost={pending_by_stream[stream['stream']]} "
+                f"verified={stream['verified']} lost={stream_lost} "
+                f"loss={loss_percent(stream['sent'], stream_lost):.3f}% "
                 f"bad_payload={stream['bad']}"
             )
 

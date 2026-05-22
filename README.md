@@ -127,7 +127,7 @@ A successful run ends like this:
 
 ```text
 --- 10.200.200.1 verified ping statistics ---
-streams=1 count_per_stream=3000 sent=3000 verified=3000 lost=0 bad_payload=0 duplicates=0 unexpected=0
+streams=1 count_per_stream=3000 sent=3000 verified=3000 lost=0 bad_payload=0 loss=0.000% duplicates=0 unexpected=0
 checked_payload=3.4MB elapsed=239.923s
 ```
 
