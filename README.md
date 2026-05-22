@@ -1,19 +1,20 @@
 # verify-ping
 
-`verify-ping` is a small ICMP echo tester for checking packet loss when you
-need stronger guarantees than a regular `ping` summary.
+`verify-ping` is a small ICMP/UDP/TCP echo tester for checking packet loss when
+you need stronger guarantees than a regular `ping` summary.
 
-It sends ICMP echo requests with a unique payload in every packet and verifies
-that each echo reply contains exactly the same payload bytes. This helps confirm
-that every counted reply belongs to the matching request and that the payload was
-not corrupted or mixed up in transit.
+It sends requests with a unique payload in every packet/message and verifies
+that each reply contains exactly the same payload bytes. This helps confirm that
+every counted reply belongs to the matching request and that the payload was not
+corrupted or mixed up in transit.
 
 ## Features
 
-- Unique deterministic payload per ICMP request
+- Unique deterministic payload per request
 - SHA-256 payload verification for every reply
-- Regular `ping`-style options for count, interval, and payload size
-- Parallel measurement streams with separate ICMP identifiers
+- ICMP, UDP, and TCP echo verification modes
+- Regular `ping`-style options for count, interval, payload size, and port
+- Parallel measurement streams with separate verification identifiers
 - Reports lost requests, bad payloads, duplicates, and unexpected replies
 - No third-party Python dependencies
 
@@ -22,8 +23,11 @@ not corrupted or mixed up in transit.
 - Python 3.9+
 - macOS or Linux
 - Root/admin privileges for raw ICMP sockets
+- A `verify-ping` UDP/TCP echo server on the remote side for UDP/TCP tests
 
 ## Usage
+
+### ICMP
 
 Equivalent to:
 
@@ -51,6 +55,44 @@ sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200 --threads 4
 
 `-c` is the packet count per stream. For example, `-c 3000 -P 4` sends
 `12000` total ICMP echo requests.
+
+### UDP
+
+Start the echo server on the remote host:
+
+```sh
+./verify_ping.py --server --protocol udp --port 50001
+```
+
+If `--port` is omitted in server mode, the OS chooses a random free port and the
+tool prints it:
+
+```sh
+./verify_ping.py --server --protocol udp
+```
+
+Run the UDP client against that port:
+
+```sh
+./verify_ping.py 10.200.200.1 --protocol udp --port 50001 -i 0.08 -c 3000 -s 1200 -P 4
+```
+
+### TCP
+
+Start the TCP echo server:
+
+```sh
+./verify_ping.py --server --protocol tcp --port 50002
+```
+
+Run the TCP client:
+
+```sh
+./verify_ping.py 10.200.200.1 --protocol tcp --port 50002 -i 0.08 -c 3000 -s 1200 -P 4
+```
+
+TCP is a byte stream, so `verify-ping` frames each payload internally before
+sending it and verifies the echoed frame payload on receipt.
 
 Print every verified reply:
 
@@ -80,5 +122,10 @@ reply payload does not match the request.
 
 ## Notes
 
-The tool uses a raw ICMP socket, so `sudo` is normally required. The ICMP
-sequence number is 16-bit, so one run is limited to `65535` packets.
+ICMP mode uses a raw ICMP socket, so `sudo` is normally required. UDP/TCP modes
+do not need raw sockets, but they do require the `verify-ping` echo server to be
+running on the other side.
+
+The sequence number is 16-bit, so one run is limited to `65535` packets per
+stream. UDP/TCP payloads must be at least `42` bytes so each packet can carry the
+verification header.
