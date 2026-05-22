@@ -22,7 +22,7 @@ corrupted or mixed up in transit.
 
 - Python 3.9+
 - macOS or Linux
-- Root/admin privileges for raw ICMP sockets
+- Root/admin privileges for raw ICMP and raw TCP sockets
 - A `verify-ping` UDP/TCP echo server on the remote side for UDP/TCP tests
 
 ## Usage
@@ -64,8 +64,8 @@ Start the echo server on the remote host:
 ./verify_ping.py --server --protocol udp --port 50001
 ```
 
-If `--port` is omitted in server mode, the OS chooses a random free port and the
-tool prints it:
+If `--port` is omitted in server mode, the tool chooses or receives a random
+port and prints it:
 
 ```sh
 ./verify_ping.py --server --protocol udp
@@ -77,22 +77,37 @@ Run the UDP client against that port:
 ./verify_ping.py 10.200.200.1 --protocol udp --port 50001 -i 0.08 -c 3000 -s 1200 -P 4
 ```
 
-### TCP
+### Raw TCP
 
-Start the TCP echo server:
-
-```sh
-./verify_ping.py --server --protocol tcp --port 50002
-```
-
-Run the TCP client:
+Start the raw TCP echo responder on the remote host:
 
 ```sh
-./verify_ping.py 10.200.200.1 --protocol tcp --port 50002 -i 0.08 -c 3000 -s 1200 -P 4
+sudo ./verify_ping.py --server --protocol tcp --port 50002
 ```
 
-TCP is a byte stream, so `verify-ping` frames each payload internally before
-sending it and verifies the echoed frame payload on receipt.
+Run the raw TCP client:
+
+```sh
+sudo ./verify_ping.py 10.200.200.1 --protocol tcp --port 50002 -i 0.08 -c 3000 -s 1200 -P 4
+```
+
+Raw TCP mode does not call `connect()` or `accept()`. It builds IPv4/TCP
+headers manually, sends standalone TCP segments with payload, and the responder
+echoes matching test payloads back as raw TCP segments. Non-test TCP packets,
+including kernel-generated RST packets, are ignored by the verifier.
+
+### TCP Stream
+
+The older application-level TCP stream echo mode is still available as
+`tcp-stream`:
+
+```sh
+./verify_ping.py --server --protocol tcp-stream --port 50003
+./verify_ping.py 10.200.200.1 --protocol tcp-stream --port 50003 -i 0.08 -c 3000 -s 1200 -P 4
+```
+
+TCP stream mode uses a normal TCP connection and frames each payload internally
+before echoing it.
 
 Print every verified reply:
 
@@ -122,9 +137,10 @@ reply payload does not match the request.
 
 ## Notes
 
-ICMP mode uses a raw ICMP socket, so `sudo` is normally required. UDP/TCP modes
-do not need raw sockets, but they do require the `verify-ping` echo server to be
-running on the other side.
+ICMP mode uses a raw ICMP socket, so `sudo` is normally required. Raw TCP mode
+also requires `sudo` on both sides. UDP and `tcp-stream` do not need raw sockets,
+but they do require the `verify-ping` echo server to be running on the other
+side.
 
 The sequence number is 16-bit, so one run is limited to `65535` packets per
 stream. UDP/TCP payloads must be at least `42` bytes so each packet can carry the

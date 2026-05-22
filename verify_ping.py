@@ -15,8 +15,16 @@ ICMP_ECHO_REQUEST = 8
 MAGIC = b"vpng2\x00\x00\x00"
 PAYLOAD_HEADER = "!HHHIQ16s"
 PAYLOAD_HEADER_SIZE = len(MAGIC) + struct.calcsize(PAYLOAD_HEADER)
+IPV4_HEADER_SIZE = 20
+RAW_TCP_HEADER_SIZE = 20
+RAW_TCP_MAX_PAYLOAD = 65535 - IPV4_HEADER_SIZE - RAW_TCP_HEADER_SIZE
 TCP_FRAME_HEADER_SIZE = 4
 UDP_MAX_PAYLOAD = 65507
+TCP_FIN = 0x01
+TCP_SYN = 0x02
+TCP_RST = 0x04
+TCP_PSH = 0x08
+TCP_ACK = 0x10
 
 
 def checksum(data):
@@ -85,6 +93,140 @@ def parse_icmp_reply(packet):
     return typ, code, ident, seq, icmp[8:]
 
 
+def route_source_ip(dest_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((dest_ip, 9))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+def make_ipv4_header(src_ip, dest_ip, protocol, body_len):
+    version_ihl = (4 << 4) | 5
+    total_len = IPV4_HEADER_SIZE + body_len
+    packet_id = random.randint(0, 0xFFFF)
+    flags_fragment = 0
+    ttl = 64
+    header = struct.pack(
+        "!BBHHHBBH4s4s",
+        version_ihl,
+        0,
+        total_len,
+        packet_id,
+        flags_fragment,
+        ttl,
+        protocol,
+        0,
+        socket.inet_aton(src_ip),
+        socket.inet_aton(dest_ip),
+    )
+    csum = checksum(header)
+    return struct.pack(
+        "!BBHHHBBH4s4s",
+        version_ihl,
+        0,
+        total_len,
+        packet_id,
+        flags_fragment,
+        ttl,
+        protocol,
+        csum,
+        socket.inet_aton(src_ip),
+        socket.inet_aton(dest_ip),
+    )
+
+
+def tcp_checksum(src_ip, dest_ip, tcp_segment):
+    pseudo = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(src_ip),
+        socket.inet_aton(dest_ip),
+        0,
+        socket.IPPROTO_TCP,
+        len(tcp_segment),
+    )
+    return checksum(pseudo + tcp_segment)
+
+
+def make_raw_tcp_packet(src_ip, dest_ip, src_port, dest_port, seq, ack, flags, payload):
+    data_offset = 5 << 4
+    window = 65535
+    urg_ptr = 0
+    tcp_header = struct.pack(
+        "!HHIIBBHHH",
+        src_port,
+        dest_port,
+        seq & 0xFFFFFFFF,
+        ack & 0xFFFFFFFF,
+        data_offset,
+        flags,
+        window,
+        0,
+        urg_ptr,
+    )
+    csum = tcp_checksum(src_ip, dest_ip, tcp_header + payload)
+    tcp_header = struct.pack(
+        "!HHIIBBHHH",
+        src_port,
+        dest_port,
+        seq & 0xFFFFFFFF,
+        ack & 0xFFFFFFFF,
+        data_offset,
+        flags,
+        window,
+        csum,
+        urg_ptr,
+    )
+    return make_ipv4_header(src_ip, dest_ip, socket.IPPROTO_TCP, len(tcp_header) + len(payload)) + tcp_header + payload
+
+
+def parse_ipv4_tcp_packet(packet):
+    if len(packet) < IPV4_HEADER_SIZE or packet[0] >> 4 != 4:
+        return None
+    ihl = (packet[0] & 0x0F) * 4
+    if len(packet) < ihl + RAW_TCP_HEADER_SIZE:
+        return None
+    protocol = packet[9]
+    if protocol != socket.IPPROTO_TCP:
+        return None
+    src_ip = socket.inet_ntoa(packet[12:16])
+    dest_ip = socket.inet_ntoa(packet[16:20])
+    tcp = packet[ihl:]
+    src_port, dest_port, seq, ack, data_offset_flags, flags, _window, _csum, _urg = struct.unpack(
+        "!HHIIBBHHH", tcp[:RAW_TCP_HEADER_SIZE]
+    )
+    tcp_header_len = (data_offset_flags >> 4) * 4
+    if len(tcp) < tcp_header_len:
+        return None
+    return {
+        "src_ip": src_ip,
+        "dest_ip": dest_ip,
+        "src_port": src_port,
+        "dest_port": dest_port,
+        "seq": seq,
+        "ack": ack,
+        "flags": flags,
+        "payload": tcp[tcp_header_len:],
+    }
+
+
+def open_raw_tcp_sockets():
+    try:
+        recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        try:
+            send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        except OSError:
+            send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    except PermissionError:
+        raise SystemExit("permission denied: run with sudo/root for raw TCP")
+    except OSError as exc:
+        raise SystemExit(f"raw TCP socket setup failed: {exc}") from exc
+    recv_sock.setblocking(False)
+    return recv_sock, send_sock
+
+
 def fmt_bytes(value):
     units = ["B", "KB", "MB", "GB", "TB"]
     n = float(value)
@@ -102,7 +244,7 @@ def parse_args():
     parser.add_argument("host", nargs="?", help="destination host for client mode")
     parser.add_argument(
         "--protocol",
-        choices=("icmp", "udp", "tcp"),
+        choices=("icmp", "udp", "tcp", "tcp-stream"),
         default="icmp",
         help="transport to test",
     )
@@ -115,14 +257,14 @@ def parse_args():
     parser.add_argument(
         "--bind",
         default="0.0.0.0",
-        help="server bind address for UDP/TCP",
+        help="server bind address for UDP/TCP; raw TCP uses it only for display/filtering",
     )
     parser.add_argument(
         "-p",
         "--port",
         type=int,
         default=None,
-        help="UDP/TCP port; server uses a random free port when omitted",
+        help="UDP/TCP port; server uses a random high port when omitted",
     )
     parser.add_argument("-c", "--count", type=int, default=3000, help="packet count per stream")
     parser.add_argument("-i", "--interval", type=float, default=0.08, help="send interval in seconds")
@@ -158,6 +300,8 @@ def validate_args(args):
         raise SystemExit(f"payload size must be at least {PAYLOAD_HEADER_SIZE} bytes")
     if not args.server and args.protocol == "udp" and args.size > UDP_MAX_PAYLOAD:
         raise SystemExit(f"udp payload size must be <= {UDP_MAX_PAYLOAD} bytes")
+    if not args.server and args.protocol == "tcp" and args.size > RAW_TCP_MAX_PAYLOAD:
+        raise SystemExit(f"raw tcp payload size must be <= {RAW_TCP_MAX_PAYLOAD} bytes")
     if args.parallel < 1:
         raise SystemExit("parallel must be positive")
     if args.parallel > 65535:
@@ -165,9 +309,10 @@ def validate_args(args):
     if args.port is not None and not (1 <= args.port <= 65535):
         raise SystemExit("port must be between 1 and 65535")
 
-    if args.protocol in ("udp", "tcp") and not args.server and args.port is None:
+    if args.protocol in ("udp", "tcp", "tcp-stream") and args.port is None:
         args.port = random.randint(49152, 65535)
-        print(f"no --port provided; picked random destination port {args.port}")
+        label = "test" if args.server else "destination"
+        print(f"no --port provided; picked random {label} port {args.port}")
 
 
 def build_streams(args):
@@ -505,7 +650,7 @@ def run_udp_client(args, dest_ip):
     return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
 
 
-def run_tcp_client(args, dest_ip):
+def run_tcp_stream_client(args, dest_ip):
     streams, started = build_streams(args)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
     target_total = args.count * args.parallel
@@ -613,6 +758,166 @@ def run_tcp_client(args, dest_ip):
     return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
 
 
+def assign_raw_tcp_source_ports(streams):
+    base_port = random.randint(20000, 60000)
+    used_ports = set()
+    for index, stream in enumerate(streams):
+        port = base_port + index
+        if port > 65535:
+            port = 20000 + (port - 65536)
+        if port in used_ports:
+            raise SystemExit("parallel produced duplicate raw TCP source ports")
+        used_ports.add(port)
+        stream["src_port"] = port
+
+
+def run_raw_tcp_client(args, dest_ip):
+    streams, started = build_streams(args)
+    assign_raw_tcp_source_ports(streams)
+    streams_by_ident = {stream["ident"]: stream for stream in streams}
+    source_ports = {stream["src_port"] for stream in streams}
+    source_ip = route_source_ip(dest_ip)
+    target_total = args.count * args.parallel
+    pending = {}
+    completed = {}
+    bad = []
+    duplicates = 0
+    unexpected = 0
+    verified_total = 0
+
+    recv_sock, send_sock = open_raw_tcp_sockets()
+    selector = selectors.DefaultSelector()
+    selector.register(recv_sock, selectors.EVENT_READ)
+    print_client_header(args, dest_ip, streams)
+    print(f"raw tcp source {source_ip}, source ports {min(source_ports)}..{max(source_ports)}")
+
+    try:
+        while sum(stream["sent"] for stream in streams) < target_total or pending:
+            now = time.monotonic()
+            for stream in streams:
+                while stream["sent"] < args.count and now >= stream["next_send"]:
+                    seq, payload = make_stream_payload(args, stream)
+                    packet = make_raw_tcp_packet(
+                        source_ip,
+                        dest_ip,
+                        stream["src_port"],
+                        args.port,
+                        seq,
+                        0,
+                        TCP_PSH | TCP_ACK,
+                        payload,
+                    )
+                    try:
+                        send_sock.sendto(packet, (dest_ip, 0))
+                    except OSError as exc:
+                        raise SystemExit(f"raw tcp send to {dest_ip}:{args.port} failed: {exc}") from exc
+                    record_pending(pending, stream, seq, payload, args.interval)
+                    now = time.monotonic()
+
+            timeout = min(next_send_wait(streams, args.count, time.monotonic(), args.timeout), args.timeout, 0.2)
+            if timeout == 0 and pending:
+                timeout = 0.001
+
+            events = selector.select(timeout)
+            for _key, _mask in events:
+                while True:
+                    try:
+                        packet, _addr = recv_sock.recvfrom(65535)
+                    except BlockingIOError:
+                        break
+
+                    parsed = parse_ipv4_tcp_packet(packet)
+                    if not parsed:
+                        continue
+                    if (
+                        parsed["src_ip"] != dest_ip
+                        or parsed["src_port"] != args.port
+                        or parsed["dst_port"] not in source_ports
+                        or not parsed["payload"].startswith(MAGIC)
+                    ):
+                        continue
+
+                    result = verify_payload(
+                        parsed["payload"],
+                        f"{parsed['src_ip']}:{parsed['src_port']}",
+                        streams_by_ident,
+                        pending,
+                        completed,
+                        bad,
+                    )
+                    if result == "duplicate":
+                        duplicates += 1
+                    elif result == "unexpected":
+                        unexpected += 1
+                    elif result != "bad":
+                        verified_total += 1
+                        _state, rec, rtt_ms = result
+                        if args.verbose or (args.progress and verified_total % args.progress == 0):
+                            print(
+                                f"ok={verified_total}/{target_total} stream={rec['stream']} "
+                                f"seq={rec['seq']} from={parsed['src_ip']}:{parsed['src_port']} "
+                                f"rtt={rtt_ms:.3f} ms"
+                            )
+
+            if should_stop_waiting(args, streams, pending, target_total):
+                break
+    finally:
+        recv_sock.close()
+        send_sock.close()
+
+    return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
+
+
+def run_raw_tcp_server(args):
+    recv_sock, send_sock = open_raw_tcp_sockets()
+    port = args.port
+    print(f"verify_ping raw tcp echo server listening on {args.bind}:{port}", flush=True)
+    print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
+
+    try:
+        while True:
+            try:
+                packet, _addr = recv_sock.recvfrom(65535)
+            except BlockingIOError:
+                time.sleep(0.001)
+                continue
+
+            parsed = parse_ipv4_tcp_packet(packet)
+            if not parsed:
+                continue
+            if parsed["dest_port"] != port or not parsed["payload"].startswith(MAGIC):
+                continue
+            if args.bind != "0.0.0.0" and parsed["dest_ip"] != args.bind:
+                continue
+
+            payload_meta = parse_payload(parsed["payload"])
+            if not payload_meta:
+                continue
+
+            ack = (parsed["seq"] + len(parsed["payload"])) & 0xFFFFFFFF
+            reply = make_raw_tcp_packet(
+                parsed["dest_ip"],
+                parsed["src_ip"],
+                port,
+                parsed["src_port"],
+                parsed["ack"],
+                ack,
+                TCP_PSH | TCP_ACK,
+                parsed["payload"],
+            )
+            try:
+                send_sock.sendto(reply, (parsed["src_ip"], 0))
+            except OSError:
+                continue
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        recv_sock.close()
+        send_sock.close()
+
+    return 0
+
+
 def run_udp_server(args):
     port = args.port or 0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -636,7 +941,7 @@ def run_udp_server(args):
     return 0
 
 
-def run_tcp_server(args):
+def run_tcp_stream_server(args):
     port = args.port or 0
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -647,7 +952,7 @@ def run_tcp_server(args):
     server.listen()
     server.setblocking(False)
     actual_host, actual_port = server.getsockname()
-    print(f"verify_ping tcp echo server listening on {actual_host}:{actual_port}", flush=True)
+    print(f"verify_ping tcp-stream echo server listening on {actual_host}:{actual_port}", flush=True)
 
     selector = selectors.DefaultSelector()
     selector.register(server, selectors.EVENT_READ, None)
@@ -706,14 +1011,18 @@ def main():
     if args.server:
         if args.protocol == "udp":
             return run_udp_server(args)
-        return run_tcp_server(args)
+        if args.protocol == "tcp":
+            return run_raw_tcp_server(args)
+        return run_tcp_stream_server(args)
 
     dest_ip = socket.gethostbyname(args.host)
     if args.protocol == "icmp":
         return run_icmp_client(args, dest_ip)
     if args.protocol == "udp":
         return run_udp_client(args, dest_ip)
-    return run_tcp_client(args, dest_ip)
+    if args.protocol == "tcp":
+        return run_raw_tcp_client(args, dest_ip)
+    return run_tcp_stream_client(args, dest_ip)
 
 
 if __name__ == "__main__":
