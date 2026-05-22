@@ -227,6 +227,39 @@ def open_raw_tcp_sockets():
     return recv_sock, send_sock
 
 
+def retry_would_block(deadline):
+    if time.monotonic() >= deadline:
+        return False
+    time.sleep(0.001)
+    return True
+
+
+def sendto_with_retry(sock, data, address, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            sock.sendto(data, address)
+            return True
+        except BlockingIOError:
+            if not retry_would_block(deadline):
+                return False
+        except InterruptedError:
+            continue
+
+
+def send_connected_with_retry(sock, data, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            sock.send(data)
+            return True
+        except BlockingIOError:
+            if not retry_would_block(deadline):
+                return False
+        except InterruptedError:
+            continue
+
+
 def fmt_bytes(value):
     units = ["B", "KB", "MB", "GB", "TB"]
     n = float(value)
@@ -524,7 +557,8 @@ def run_icmp_client(args, dest_ip):
             while stream["sent"] < args.count and now >= stream["next_send"]:
                 seq, payload = make_stream_payload(args, stream)
                 packet = make_icmp_packet(stream["ident"], seq, payload)
-                sock.sendto(packet, (dest_ip, 0))
+                if not sendto_with_retry(sock, packet, (dest_ip, 0), args.timeout):
+                    raise SystemExit(f"icmp send to {dest_ip} timed out waiting for socket buffer")
                 record_pending(pending, stream, seq, payload, args.interval)
                 now = time.monotonic()
 
@@ -599,9 +633,13 @@ def run_udp_client(args, dest_ip):
             while stream["sent"] < args.count and now >= stream["next_send"]:
                 seq, payload = make_stream_payload(args, stream)
                 try:
-                    stream["sock"].send(payload)
-                except OSError:
-                    pass
+                    sent = send_connected_with_retry(stream["sock"], payload, args.timeout)
+                except OSError as exc:
+                    raise SystemExit(f"udp send to {dest_ip}:{args.port} failed: {exc}") from exc
+                if not sent:
+                    raise SystemExit(
+                        f"udp send to {dest_ip}:{args.port} timed out waiting for socket buffer"
+                    )
                 record_pending(pending, stream, seq, payload, args.interval)
                 now = time.monotonic()
 
@@ -808,9 +846,13 @@ def run_raw_tcp_client(args, dest_ip):
                         payload,
                     )
                     try:
-                        send_sock.sendto(packet, (dest_ip, 0))
+                        sent = sendto_with_retry(send_sock, packet, (dest_ip, 0), args.timeout)
                     except OSError as exc:
                         raise SystemExit(f"raw tcp send to {dest_ip}:{args.port} failed: {exc}") from exc
+                    if not sent:
+                        raise SystemExit(
+                            f"raw tcp send to {dest_ip}:{args.port} timed out waiting for socket buffer"
+                        )
                     record_pending(pending, stream, seq, payload, args.interval)
                     now = time.monotonic()
 
@@ -906,7 +948,7 @@ def run_raw_tcp_server(args):
                 parsed["payload"],
             )
             try:
-                send_sock.sendto(reply, (parsed["src_ip"], 0))
+                sendto_with_retry(send_sock, reply, (parsed["src_ip"], 0), 1.0)
             except OSError:
                 continue
     except KeyboardInterrupt:
