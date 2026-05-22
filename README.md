@@ -56,12 +56,16 @@ sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200 --threads 4
 `-c` is the packet count per stream. For example, `-c 3000 -P 4` sends
 `12000` total ICMP echo requests.
 
+For UDP, raw TCP, and `tcp-stream`, parallel streams use consecutive ports. For
+example, `--port 50001 -P 4` uses ports `50001`, `50002`, `50003`, and `50004`
+on both the client and server side.
+
 ### UDP
 
 Start the echo server on the remote host:
 
 ```sh
-./verify_ping.py --server --protocol udp --port 50001
+./verify_ping.py --server --protocol udp --port 50001 -P 4
 ```
 
 If `--port` is omitted in server mode, the tool chooses or receives a random
@@ -82,7 +86,7 @@ Run the UDP client against that port:
 Start the raw TCP echo responder on the remote host:
 
 ```sh
-sudo ./verify_ping.py --server --protocol tcp --port 50002
+sudo ./verify_ping.py --server --protocol tcp --port 50002 -P 4
 ```
 
 Run the raw TCP client:
@@ -102,7 +106,7 @@ The older application-level TCP stream echo mode is still available as
 `tcp-stream`:
 
 ```sh
-./verify_ping.py --server --protocol tcp-stream --port 50003
+./verify_ping.py --server --protocol tcp-stream --port 50003 -P 4
 ./verify_ping.py 10.200.200.1 --protocol tcp-stream --port 50003 -i 0.08 -c 3000 -s 1200 -P 4
 ```
 

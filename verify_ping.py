@@ -349,9 +349,20 @@ def validate_args(args):
         raise SystemExit("port must be between 1 and 65535")
 
     if args.protocol in ("udp", "tcp", "tcp-stream") and args.port is None:
-        args.port = random.randint(49152, 65535)
+        max_base_port = 65535 - args.parallel + 1
+        min_base_port = 49152 if max_base_port >= 49152 else 1024
+        if max_base_port < min_base_port:
+            min_base_port = 1
+        args.port = random.randint(min_base_port, max_base_port)
         label = "test" if args.server else "destination"
-        print(f"no --port provided; picked random {label} port {args.port}")
+        print(f"no --port provided; picked random {label} base port {args.port}")
+
+    if args.protocol in ("udp", "tcp", "tcp-stream"):
+        last_port = args.port + args.parallel - 1
+        if last_port > 65535:
+            raise SystemExit(
+                f"port range {args.port}..{last_port} exceeds 65535; reduce --parallel or --port"
+            )
 
 
 def build_streams(args):
@@ -393,9 +404,27 @@ def ident_range(streams):
     return f"0x{streams[0]['ident']:04x}..0x{streams[-1]['ident']:04x}"
 
 
+def stream_port(args, stream):
+    return args.port + stream["stream"] - 1
+
+
+def port_range(args):
+    if args.protocol == "icmp":
+        return None
+    first = args.port
+    last = args.port + args.parallel - 1
+    return f"{first}" if first == last else f"{first}..{last}"
+
+
+def endpoint_label(args, host):
+    if args.protocol == "icmp":
+        return host
+    return f"{host}:{port_range(args)}"
+
+
 def print_client_header(args, dest_ip, streams):
     target_total = args.count * args.parallel
-    endpoint = dest_ip if args.protocol == "icmp" else f"{dest_ip}:{args.port}"
+    endpoint = endpoint_label(args, dest_ip)
     print(
         f"verify_ping {args.protocol} {endpoint}: {args.count} packets/stream, "
         f"{args.parallel} streams, {target_total} total packets, {args.size} data bytes, "
@@ -410,7 +439,7 @@ def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates
     checked_bytes = verified_total * args.size
     elapsed = time.monotonic() - started
 
-    endpoint = dest_ip if args.protocol == "icmp" else f"{dest_ip}:{args.port}"
+    endpoint = endpoint_label(args, dest_ip)
     print()
     print(f"--- {endpoint} verified {args.protocol} statistics ---")
     print(
@@ -623,13 +652,15 @@ def run_udp_client(args, dest_ip):
     selector = selectors.DefaultSelector()
     socket_to_stream = {}
     for stream in streams:
+        port = stream_port(args, stream)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.connect((dest_ip, args.port))
+            sock.connect((dest_ip, port))
         except OSError as exc:
-            raise SystemExit(f"udp connect to {dest_ip}:{args.port} failed: {exc}") from exc
+            raise SystemExit(f"udp connect to {dest_ip}:{port} failed: {exc}") from exc
         sock.setblocking(False)
         stream["sock"] = sock
+        stream["port"] = port
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
 
@@ -643,10 +674,10 @@ def run_udp_client(args, dest_ip):
                 try:
                     sent = send_connected_with_retry(stream["sock"], payload, args.timeout)
                 except OSError as exc:
-                    raise SystemExit(f"udp send to {dest_ip}:{args.port} failed: {exc}") from exc
+                    raise SystemExit(f"udp send to {dest_ip}:{stream['port']} failed: {exc}") from exc
                 if not sent:
                     raise SystemExit(
-                        f"udp send to {dest_ip}:{args.port} timed out waiting for socket buffer"
+                        f"udp send to {dest_ip}:{stream['port']} timed out waiting for socket buffer"
                     )
                 record_pending(pending, stream, seq, payload, args.interval)
                 now = time.monotonic()
@@ -668,7 +699,7 @@ def run_udp_client(args, dest_ip):
 
                 result = verify_payload(
                     payload,
-                    f"{dest_ip}:{args.port}",
+                    f"{dest_ip}:{stream['port']}",
                     streams_by_ident,
                     pending,
                     completed,
@@ -684,7 +715,7 @@ def run_udp_client(args, dest_ip):
                     if args.verbose or (args.progress and verified_total % args.progress == 0):
                         print(
                             f"ok={verified_total}/{target_total} stream={rec['stream']} "
-                            f"seq={rec['seq']} from={dest_ip}:{args.port} rtt={rtt_ms:.3f} ms"
+                            f"seq={rec['seq']} from={dest_ip}:{stream['port']} rtt={rtt_ms:.3f} ms"
                         )
 
         if should_stop_waiting(args, streams, pending, target_total):
@@ -710,12 +741,14 @@ def run_tcp_stream_client(args, dest_ip):
     selector = selectors.DefaultSelector()
     socket_to_stream = {}
     for stream in streams:
+        port = stream_port(args, stream)
         try:
-            sock = socket.create_connection((dest_ip, args.port), timeout=args.timeout)
+            sock = socket.create_connection((dest_ip, port), timeout=args.timeout)
         except OSError as exc:
-            raise SystemExit(f"tcp connect to {dest_ip}:{args.port} failed: {exc}") from exc
+            raise SystemExit(f"tcp connect to {dest_ip}:{port} failed: {exc}") from exc
         sock.setblocking(False)
         stream["sock"] = sock
+        stream["port"] = port
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
 
@@ -773,7 +806,7 @@ def run_tcp_stream_client(args, dest_ip):
 
                         result = verify_payload(
                             payload,
-                            f"{dest_ip}:{args.port}",
+                            f"{dest_ip}:{stream['port']}",
                             streams_by_ident,
                             pending,
                             completed,
@@ -789,7 +822,7 @@ def run_tcp_stream_client(args, dest_ip):
                             if args.verbose or (args.progress and verified_total % args.progress == 0):
                                 print(
                                     f"ok={verified_total}/{target_total} stream={rec['stream']} "
-                                    f"seq={rec['seq']} from={dest_ip}:{args.port} rtt={rtt_ms:.3f} ms"
+                                    f"seq={rec['seq']} from={dest_ip}:{stream['port']} rtt={rtt_ms:.3f} ms"
                                 )
 
         if should_stop_waiting(args, streams, pending, target_total):
@@ -841,13 +874,14 @@ def run_raw_tcp_client(args, dest_ip):
         while sum(stream["sent"] for stream in streams) < target_total or pending:
             now = time.monotonic()
             for stream in streams:
+                port = stream_port(args, stream)
                 while stream["sent"] < args.count and now >= stream["next_send"]:
                     seq, payload = make_stream_payload(args, stream)
                     packet = make_raw_tcp_packet(
                         source_ip,
                         dest_ip,
                         stream["src_port"],
-                        args.port,
+                        port,
                         seq,
                         0,
                         TCP_PSH | TCP_ACK,
@@ -856,10 +890,10 @@ def run_raw_tcp_client(args, dest_ip):
                     try:
                         sent = sendto_with_retry(send_sock, packet, (dest_ip, 0), args.timeout)
                     except OSError as exc:
-                        raise SystemExit(f"raw tcp send to {dest_ip}:{args.port} failed: {exc}") from exc
+                        raise SystemExit(f"raw tcp send to {dest_ip}:{port} failed: {exc}") from exc
                     if not sent:
                         raise SystemExit(
-                            f"raw tcp send to {dest_ip}:{args.port} timed out waiting for socket buffer"
+                            f"raw tcp send to {dest_ip}:{port} timed out waiting for socket buffer"
                         )
                     record_pending(pending, stream, seq, payload, args.interval)
                     now = time.monotonic()
@@ -881,8 +915,8 @@ def run_raw_tcp_client(args, dest_ip):
                         continue
                     if (
                         parsed["src_ip"] != dest_ip
-                        or parsed["src_port"] != args.port
-                        or parsed["dst_port"] not in source_ports
+                        or not (args.port <= parsed["src_port"] <= args.port + args.parallel - 1)
+                        or parsed["dest_port"] not in source_ports
                         or not parsed["payload"].startswith(MAGIC)
                     ):
                         continue
@@ -920,8 +954,9 @@ def run_raw_tcp_client(args, dest_ip):
 
 def run_raw_tcp_server(args):
     recv_sock, send_sock = open_raw_tcp_sockets()
-    port = args.port
-    print(f"verify_ping raw tcp echo server listening on {args.bind}:{port}", flush=True)
+    first_port = args.port
+    last_port = args.port + args.parallel - 1
+    print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
 
     try:
@@ -935,7 +970,9 @@ def run_raw_tcp_server(args):
             parsed = parse_ipv4_tcp_packet(packet)
             if not parsed:
                 continue
-            if parsed["dest_port"] != port or not parsed["payload"].startswith(MAGIC):
+            if not (first_port <= parsed["dest_port"] <= last_port):
+                continue
+            if not parsed["payload"].startswith(MAGIC):
                 continue
             if args.bind != "0.0.0.0" and parsed["dest_ip"] != args.bind:
                 continue
@@ -948,7 +985,7 @@ def run_raw_tcp_server(args):
             reply = make_raw_tcp_packet(
                 parsed["dest_ip"],
                 parsed["src_ip"],
-                port,
+                parsed["dest_port"],
                 parsed["src_port"],
                 parsed["ack"],
                 ack,
@@ -969,57 +1006,74 @@ def run_raw_tcp_server(args):
 
 
 def run_udp_server(args):
-    port = args.port or 0
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.bind((args.bind, port))
-    except OSError as exc:
-        raise SystemExit(f"udp bind to {args.bind}:{port} failed: {exc}") from exc
-    actual_host, actual_port = sock.getsockname()
-    print(f"verify_ping udp echo server listening on {actual_host}:{actual_port}", flush=True)
+    selector = selectors.DefaultSelector()
+    sockets = []
+    for offset in range(args.parallel):
+        port = args.port + offset
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((args.bind, port))
+        except OSError as exc:
+            raise SystemExit(f"udp bind to {args.bind}:{port} failed: {exc}") from exc
+        sock.setblocking(False)
+        selector.register(sock, selectors.EVENT_READ)
+        sockets.append(sock)
+
+    actual_host = sockets[0].getsockname()[0]
+    print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
 
     try:
         while True:
-            data, addr = sock.recvfrom(UDP_MAX_PAYLOAD)
-            if data:
-                sock.sendto(data, addr)
+            for key, _mask in selector.select(1.0):
+                while True:
+                    try:
+                        data, addr = key.fileobj.recvfrom(UDP_MAX_PAYLOAD)
+                    except BlockingIOError:
+                        break
+                    if data:
+                        key.fileobj.sendto(data, addr)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
-        sock.close()
+        for sock in sockets:
+            selector.unregister(sock)
+            sock.close()
 
     return 0
 
 
 def run_tcp_stream_server(args):
-    port = args.port or 0
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        server.bind((args.bind, port))
-    except OSError as exc:
-        raise SystemExit(f"tcp bind to {args.bind}:{port} failed: {exc}") from exc
-    server.listen()
-    server.setblocking(False)
-    actual_host, actual_port = server.getsockname()
-    print(f"verify_ping tcp-stream echo server listening on {actual_host}:{actual_port}", flush=True)
-
     selector = selectors.DefaultSelector()
-    selector.register(server, selectors.EVENT_READ, None)
     buffers = {}
+    listeners = []
+    for offset in range(args.parallel):
+        port = args.port + offset
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind((args.bind, port))
+        except OSError as exc:
+            raise SystemExit(f"tcp bind to {args.bind}:{port} failed: {exc}") from exc
+        server.listen()
+        server.setblocking(False)
+        selector.register(server, selectors.EVENT_READ, {"listener": True})
+        listeners.append(server)
+
+    actual_host = listeners[0].getsockname()[0]
+    print(f"verify_ping tcp-stream echo server listening on {actual_host}:{port_range(args)}", flush=True)
 
     try:
         while True:
             for key, mask in selector.select(1.0):
-                if key.data is None:
-                    conn, _addr = server.accept()
+                if key.data and key.data.get("listener"):
+                    conn, _addr = key.fileobj.accept()
                     conn.setblocking(False)
                     buffers[conn.fileno()] = bytearray()
-                    selector.register(conn, selectors.EVENT_READ, conn.fileno())
+                    selector.register(conn, selectors.EVENT_READ, {"listener": False, "fileno": conn.fileno()})
                     continue
 
                 conn = key.fileobj
-                fileno = key.data
+                fileno = key.data["fileno"]
                 if mask & selectors.EVENT_READ:
                     try:
                         data = conn.recv(65535)
@@ -1031,7 +1085,11 @@ def run_tcp_stream_server(args):
                         conn.close()
                         continue
                     buffers[fileno].extend(data)
-                    selector.modify(conn, selectors.EVENT_READ | selectors.EVENT_WRITE, fileno)
+                    selector.modify(
+                        conn,
+                        selectors.EVENT_READ | selectors.EVENT_WRITE,
+                        {"listener": False, "fileno": fileno},
+                    )
 
                 if mask & selectors.EVENT_WRITE and buffers.get(fileno):
                     try:
@@ -1043,7 +1101,11 @@ def run_tcp_stream_server(args):
                         continue
                     del buffers[fileno][:sent]
                     if not buffers[fileno]:
-                        selector.modify(conn, selectors.EVENT_READ, fileno)
+                        selector.modify(
+                            conn,
+                            selectors.EVENT_READ,
+                            {"listener": False, "fileno": fileno},
+                        )
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
