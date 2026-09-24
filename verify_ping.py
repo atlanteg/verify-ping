@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import json
 import os
 import random
 import selectors
 import socket
 import struct
 import sys
+import threading
 import time
 
 
 ICMP_ECHO_REPLY = 0
 ICMP_ECHO_REQUEST = 8
-MAGIC = b"vpng2\x00\x00\x00"
+MAGIC = b"vpng3\x00\x00\x00"
+# Client-owned header: ident, stream, seq, index, send_ns, run_nonce.
 PAYLOAD_HEADER = "!HHHIQ16s"
-PAYLOAD_HEADER_SIZE = len(MAGIC) + struct.calcsize(PAYLOAD_HEADER)
+CLIENT_HEADER_SIZE = len(MAGIC) + struct.calcsize(PAYLOAD_HEADER)
+# Server-owned stamp, written by the echo server into every reply:
+#   rseq   -- per-stream monotonic receive counter (server arrival order)
+#   recv_ns-- server receive timestamp (reserved for one-way delay use)
+# The client always sends this region zeroed; it is normalized back to zero
+# before payload verification, so SHA-256 still covers the whole packet.
+STAMP_FMT = "!IQ"
+STAMP_SIZE = struct.calcsize(STAMP_FMT)
+STAMP_OFFSET = CLIENT_HEADER_SIZE
+STAMP_END = STAMP_OFFSET + STAMP_SIZE
+PAYLOAD_HEADER_SIZE = STAMP_END
+# Control channel: reliable TCP side-channel the client uses after a run to
+# fetch the server's per-stream arrival log for directional attribution.
+DEFAULT_CONTROL_OFFSET = 1000
+CONTROL_PROTOCOLS = ("udp", "tcp")
 IPV4_HEADER_SIZE = 20
 RAW_TCP_HEADER_SIZE = 20
 RAW_TCP_MAX_PAYLOAD = 65535 - IPV4_HEADER_SIZE - RAW_TCP_HEADER_SIZE
@@ -47,7 +64,13 @@ def expand(seed, size):
 
 
 def make_payload(size, ident, stream, seq, index, send_ns, run_nonce):
-    prefix = MAGIC + struct.pack(PAYLOAD_HEADER, ident, stream, seq, index, send_ns, run_nonce)
+    # Client header followed by a zeroed server stamp; the deterministic
+    # filler is derived from the whole prefix so every packet is unique.
+    prefix = (
+        MAGIC
+        + struct.pack(PAYLOAD_HEADER, ident, stream, seq, index, send_ns, run_nonce)
+        + bytes(STAMP_SIZE)
+    )
     if size <= len(prefix):
         return prefix[:size]
     return prefix + expand(prefix, size - len(prefix))
@@ -58,8 +81,9 @@ def parse_payload(payload):
         return None
     start = len(MAGIC)
     ident, stream, seq, index, send_ns, nonce = struct.unpack(
-        PAYLOAD_HEADER, payload[start:PAYLOAD_HEADER_SIZE]
+        PAYLOAD_HEADER, payload[start:CLIENT_HEADER_SIZE]
     )
+    rseq, recv_ns = struct.unpack_from(STAMP_FMT, payload, STAMP_OFFSET)
     return {
         "ident": ident,
         "stream": stream,
@@ -67,7 +91,134 @@ def parse_payload(payload):
         "index": index,
         "send_ns": send_ns,
         "nonce": nonce,
+        "rseq": rseq,
+        "recv_ns": recv_ns,
     }
+
+
+def stamp_payload(payload, rseq, recv_ns):
+    """Return a copy of payload with the server stamp filled in."""
+    buf = bytearray(payload)
+    struct.pack_into(STAMP_FMT, buf, STAMP_OFFSET, rseq & 0xFFFFFFFF, recv_ns & 0xFFFFFFFFFFFFFFFF)
+    return bytes(buf)
+
+
+def normalize_payload(payload):
+    """Return payload with the server stamp zeroed, as the client sent it."""
+    if len(payload) < STAMP_END:
+        return payload
+    buf = bytearray(payload)
+    struct.pack_into(STAMP_FMT, buf, STAMP_OFFSET, 0, 0)
+    return bytes(buf)
+
+
+def count_reordered(keys):
+    """RFC 4737 style late-arrival count: entries below the running maximum."""
+    reordered = 0
+    run_max = None
+    for key in keys:
+        if run_max is not None and key < run_max:
+            reordered += 1
+        else:
+            run_max = key
+    return reordered
+
+
+class ArrivalLog:
+    """Server-side per-stream arrival accounting, keyed by run nonce."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.arrivals = {}
+
+    def record(self, nonce, seq):
+        with self.lock:
+            log = self.arrivals.setdefault(nonce, [])
+            log.append(seq)
+            return len(log)
+
+    def dump(self, nonces):
+        with self.lock:
+            return {nonce.hex(): list(self.arrivals.get(nonce, [])) for nonce in nonces}
+
+
+def control_port_for(args):
+    return args.control_port if args.control_port else args.port + DEFAULT_CONTROL_OFFSET
+
+
+def send_control_message(sock, obj):
+    data = json.dumps(obj).encode("utf-8")
+    sock.sendall(struct.pack("!I", len(data)) + data)
+
+
+def recv_control_message(sock, timeout):
+    sock.settimeout(timeout)
+    header = b""
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
+        if not chunk:
+            raise ConnectionError("control connection closed")
+        header += chunk
+    length = struct.unpack("!I", header)[0]
+    if length > 64 << 20:
+        raise ConnectionError("control message too large")
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(min(65536, length - len(body)))
+        if not chunk:
+            raise ConnectionError("control connection closed")
+        body += chunk
+    return json.loads(body.decode("utf-8"))
+
+
+def start_control_server(args, arrival_log):
+    """Serve arrival logs over TCP in a daemon thread; returns bound port."""
+    port = control_port_for(args)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind((args.bind, port))
+    except OSError as exc:
+        raise SystemExit(f"control bind to {args.bind}:{port} failed: {exc}") from exc
+    listener.listen()
+
+    def serve():
+        while True:
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                return
+            try:
+                request = recv_control_message(conn, 10.0)
+                nonces = [bytes.fromhex(item) for item in request.get("nonces", [])]
+                send_control_message(conn, {"logs": arrival_log.dump(nonces)})
+            except (OSError, ValueError, ConnectionError):
+                pass
+            finally:
+                conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+def fetch_arrival_logs(args, dest_ip, streams):
+    """Client side: pull the server arrival log for our streams. None on failure."""
+    port = control_port_for(args)
+    try:
+        sock = socket.create_connection((dest_ip, port), timeout=args.timeout)
+    except OSError as exc:
+        print(f"control: cannot reach {dest_ip}:{port} ({exc}); directional stats unavailable")
+        return None
+    try:
+        send_control_message(sock, {"nonces": [stream["nonce"].hex() for stream in streams]})
+        reply = recv_control_message(sock, max(args.timeout, 5.0))
+    except (OSError, ValueError, ConnectionError) as exc:
+        print(f"control: fetch from {dest_ip}:{port} failed ({exc}); directional stats unavailable")
+        return None
+    finally:
+        sock.close()
+    logs = reply.get("logs", {})
+    return {stream["stream"]: logs.get(stream["nonce"].hex(), []) for stream in streams}
 
 
 def make_icmp_packet(ident, seq, payload):
@@ -319,6 +470,17 @@ def parse_args():
     parser.add_argument("-W", "--timeout", type=float, default=3.0, help="seconds to wait after last send")
     parser.add_argument("--progress", type=int, default=100, help="print progress every N verified replies")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=None,
+        help=f"TCP control port for directional stats (default: port + {DEFAULT_CONTROL_OFFSET})",
+    )
+    parser.add_argument(
+        "--no-directional",
+        action="store_true",
+        help="skip the post-run control fetch; report round-trip stats only",
+    )
     return parser.parse_args()
 
 
@@ -364,6 +526,21 @@ def validate_args(args):
                 f"port range {args.port}..{last_port} exceeds 65535; reduce --parallel or --port"
             )
 
+    if args.protocol in CONTROL_PROTOCOLS:
+        if args.control_port is not None and not (1 <= args.control_port <= 65535):
+            raise SystemExit("control port must be between 1 and 65535")
+        control_port = control_port_for(args)
+        if control_port > 65535:
+            raise SystemExit(
+                f"default control port {control_port} exceeds 65535; set --control-port explicitly"
+            )
+        first_port = args.port
+        last_port = args.port + args.parallel - 1
+        if first_port <= control_port <= last_port:
+            raise SystemExit(
+                f"control port {control_port} collides with data ports {first_port}..{last_port}"
+            )
+
 
 def build_streams(args):
     base_ident = os.getpid() & 0xFFFF
@@ -390,6 +567,9 @@ def build_streams(args):
                 "out": bytearray(),
                 "in": bytearray(),
                 "closed": False,
+                # Reply arrival order at the client, one entry per first-time
+                # verified reply: (seq, rseq). Used for reordering direction.
+                "replies": [],
             }
         )
 
@@ -481,7 +661,102 @@ def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates
         if len(bad) > 20:
             print(f"bad payload: ... {len(bad) - 20} more")
 
+    if args.protocol in CONTROL_PROTOCOLS and not args.no_directional:
+        print_directional_stats(args, dest_ip, streams)
+    elif args.protocol == "icmp":
+        print("directional stats: n/a for icmp (echo comes from the remote OS, no arrival log)")
+    elif args.protocol == "tcp-stream":
+        print("directional stats: n/a for tcp-stream (TCP masks loss and reordering)")
+
     return 0 if sent_total == verified_total and not pending and not bad else 1
+
+
+def directional_summary(stream, server_log):
+    """Attribute loss/reordering/duplication to the forward or reverse path.
+
+    server_log: seqs in the order the server received them (forward-delivered).
+    stream["replies"]: (seq, rseq) in the order the client verified replies.
+    """
+    sent_seqs = set(range(1, stream["sent"] + 1))
+    reached = set(server_log)
+    verified = {seq for seq, _rseq in stream["replies"]}
+
+    forward_lost = sorted(sent_seqs - reached)
+    reverse_lost = sorted(reached - verified)
+    return {
+        "sent": stream["sent"],
+        "reached": len(reached),
+        "verified": len(verified),
+        "forward_lost": forward_lost,
+        "reverse_lost": reverse_lost,
+        # Duplicates: forward = server saw a seq more than once; reverse = client
+        # counted the same verified seq again (already tracked as `duplicates`).
+        "forward_dup": len(server_log) - len(reached),
+        # Reordering (RFC 4737 late-arrival count):
+        #   forward: seq inversions in server arrival order
+        #   reverse: rseq inversions in client reply-arrival order, i.e. against
+        #            the order the server actually emitted echoes
+        #   end_to_end: seq inversions in client reply-arrival order (naive view)
+        "reorder_forward": count_reordered(server_log),
+        "reorder_reverse": count_reordered([rseq for _seq, rseq in stream["replies"]]),
+        "reorder_end_to_end": count_reordered([seq for seq, _rseq in stream["replies"]]),
+    }
+
+
+def fmt_seq_list(seqs, limit=20):
+    shown = ", ".join(str(seq) for seq in seqs[:limit])
+    return shown + (" ..." if len(seqs) > limit else "")
+
+
+def print_directional_stats(args, dest_ip, streams):
+    logs = fetch_arrival_logs(args, dest_ip, streams)
+    if logs is None:
+        return
+
+    if all(rseq == 0 for stream in streams for _seq, rseq in stream["replies"]) and any(
+        stream["replies"] for stream in streams
+    ):
+        print("directional stats: server did not stamp replies (old server version?); unavailable")
+        return
+
+    summaries = [(stream, directional_summary(stream, logs[stream["stream"]])) for stream in streams]
+    totals = {
+        key: sum(summary[key] for _stream, summary in summaries)
+        for key in ("sent", "reached", "verified", "forward_dup", "reorder_forward",
+                    "reorder_reverse", "reorder_end_to_end")
+    }
+    totals["forward_lost"] = sum(len(summary["forward_lost"]) for _stream, summary in summaries)
+    totals["reverse_lost"] = sum(len(summary["reverse_lost"]) for _stream, summary in summaries)
+
+    print()
+    print(f"--- directional statistics (server arrival log via control port {control_port_for(args)}) ---")
+
+    def print_block(label, summary, forward_lost, reverse_lost):
+        sent = summary["sent"]
+        total_lost = forward_lost + reverse_lost
+        print(
+            f"{label}sent={sent} reached_server={summary['reached']} verified={summary['verified']}"
+        )
+        print(
+            f"{label}loss: forward={forward_lost} ({loss_percent(sent, forward_lost):.3f}%) "
+            f"reverse={reverse_lost} ({loss_percent(sent, reverse_lost):.3f}%) "
+            f"total={total_lost} ({loss_percent(sent, total_lost):.3f}%)"
+        )
+        print(
+            f"{label}reorder: forward={summary['reorder_forward']} "
+            f"reverse={summary['reorder_reverse']} end_to_end={summary['reorder_end_to_end']}  "
+            f"forward_dup={summary['forward_dup']}"
+        )
+
+    if len(summaries) > 1:
+        print_block("all streams: ", totals, totals["forward_lost"], totals["reverse_lost"])
+    for stream, summary in summaries:
+        label = f"stream={stream['stream']} " if len(summaries) > 1 else ""
+        print_block(label, summary, len(summary["forward_lost"]), len(summary["reverse_lost"]))
+        if summary["forward_lost"]:
+            print(f"{label}forward-lost seqs (never reached server): {fmt_seq_list(summary['forward_lost'])}")
+        if summary["reverse_lost"]:
+            print(f"{label}reverse-lost seqs (echo never returned): {fmt_seq_list(summary['reverse_lost'])}")
 
 
 def make_stream_payload(args, stream):
@@ -521,7 +796,9 @@ def verify_payload(payload, source, streams_by_ident, pending, completed, bad):
 
     key = (parsed["ident"], parsed["seq"])
     rec = pending.get(key)
-    digest = hashlib.sha256(payload).digest()
+    # The server stamp is the only region a legitimate echo may change;
+    # zero it back out so the digest covers exactly what was sent.
+    digest = hashlib.sha256(normalize_payload(payload)).digest()
     if rec is None:
         return "duplicate" if completed.get(key) == digest else "unexpected"
 
@@ -547,6 +824,7 @@ def verify_payload(payload, source, streams_by_ident, pending, completed, bad):
 
     rtt_ms = (time.monotonic() - rec["sent_at"]) * 1000.0
     stream["verified"] += 1
+    stream["replies"].append((parsed["seq"], parsed["rseq"]))
     completed[key] = digest
     del pending[key]
     return "ok", rec, rtt_ms
@@ -956,8 +1234,11 @@ def run_raw_tcp_server(args):
     recv_sock, send_sock = open_raw_tcp_sockets()
     first_port = args.port
     last_port = args.port + args.parallel - 1
+    arrival_log = ArrivalLog()
+    control_port = start_control_server(args, arrival_log)
     print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
+    print(f"control port {control_port}/tcp serves arrival logs for directional stats", flush=True)
 
     try:
         while True:
@@ -981,6 +1262,8 @@ def run_raw_tcp_server(args):
             if not payload_meta:
                 continue
 
+            rseq = arrival_log.record(payload_meta["nonce"], payload_meta["seq"])
+            echo_payload = stamp_payload(parsed["payload"], rseq, time.monotonic_ns())
             ack = (parsed["seq"] + len(parsed["payload"])) & 0xFFFFFFFF
             reply = make_raw_tcp_packet(
                 parsed["dest_ip"],
@@ -990,7 +1273,7 @@ def run_raw_tcp_server(args):
                 parsed["ack"],
                 ack,
                 TCP_PSH | TCP_ACK,
-                parsed["payload"],
+                echo_payload,
             )
             try:
                 sendto_with_retry(send_sock, reply, (parsed["src_ip"], 0), 1.0)
@@ -1019,8 +1302,11 @@ def run_udp_server(args):
         selector.register(sock, selectors.EVENT_READ)
         sockets.append(sock)
 
+    arrival_log = ArrivalLog()
+    control_port = start_control_server(args, arrival_log)
     actual_host = sockets[0].getsockname()[0]
     print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
+    print(f"control port {control_port}/tcp serves arrival logs for directional stats", flush=True)
 
     try:
         while True:
@@ -1030,8 +1316,13 @@ def run_udp_server(args):
                         data, addr = key.fileobj.recvfrom(UDP_MAX_PAYLOAD)
                     except BlockingIOError:
                         break
-                    if data:
-                        key.fileobj.sendto(data, addr)
+                    if not data:
+                        continue
+                    meta = parse_payload(data)
+                    if meta:
+                        rseq = arrival_log.record(meta["nonce"], meta["seq"])
+                        data = stamp_payload(data, rseq, time.monotonic_ns())
+                    key.fileobj.sendto(data, addr)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:

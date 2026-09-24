@@ -1,7 +1,7 @@
 [project]
 name = "verify-ping"
-version = "0.5.0"
-description = "ICMP, UDP, raw TCP, and TCP stream echo tester with payload verification"
+version = "0.6.0"
+description = "ICMP, UDP, raw TCP, and TCP stream echo tester with payload verification and per-direction loss/reordering attribution"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
