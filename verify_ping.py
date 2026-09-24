@@ -247,13 +247,23 @@ def serve_ctrl_request(arrival_log, data):
 def fetch_arrival_logs(args, streams, send_request, recv_replies):
     """Client side: pull each stream's arrival log over the data path.
 
-    send_request(stream, data) sends one control datagram for that stream;
-    recv_replies(timeout) returns raw control payloads received meanwhile.
-    Chunks are independent, so lost ones are simply requested again.
-    Returns {stream_no: [seqs in server arrival order]} or None on failure.
+    send_request(carrier, data) sends one control datagram on the carrier
+    stream's socket/port; recv_replies(timeout) returns raw control payloads
+    received meanwhile. Chunks are independent, so lost ones are simply
+    requested again. The server keys logs by nonce, not by port, so after the
+    first round a stream whose own port is blocked is retried through the
+    other streams' sockets; that is how a firewalled port still gets its
+    "nothing reached the server" verdict.
+    Returns {stream_no: [seqs in server arrival order] or None if unavailable}.
     """
     states = {
-        stream["nonce"]: {"stream": stream, "total_chunks": None, "total": None, "chunks": {}}
+        stream["nonce"]: {
+            "stream": stream,
+            "total_chunks": None,
+            "total": None,
+            "chunks": {},
+            "attempt": 0,
+        }
         for stream in streams
     }
     deadline = time.monotonic() + max(10.0, args.timeout * 3)
@@ -262,21 +272,26 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
         wanted = []
         for state in states.values():
             if state["total_chunks"] is None:
-                wanted.append((state["stream"], 0))
+                wanted.append((state, 0))
             else:
                 wanted.extend(
-                    (state["stream"], index)
+                    (state, index)
                     for index in range(state["total_chunks"])
                     if index not in state["chunks"]
                 )
         if not wanted:
             break
 
-        for stream, index in wanted[:CTRL_WINDOW]:
+        for state, index in wanted[:CTRL_WINDOW]:
+            stream = state["stream"]
+            position = streams.index(stream)
+            carrier = streams[(position + state["attempt"]) % len(streams)]
             try:
-                send_request(stream, make_ctrl_request(stream["nonce"], index))
+                send_request(carrier, make_ctrl_request(stream["nonce"], index))
             except OSError:
                 pass
+        for state, _index in wanted:
+            state["attempt"] += 1
 
         for data in recv_replies(CTRL_ROUND_WAIT):
             reply = parse_ctrl_reply(data)
@@ -297,25 +312,28 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
             if reply["index"] < reply["total_chunks"]:
                 state["chunks"][reply["index"]] = reply["seqs"]
 
-    incomplete = [
-        state["stream"]["stream"]
-        for state in states.values()
-        if state["total_chunks"] is None or len(state["chunks"]) != state["total_chunks"]
-    ]
-    if incomplete:
-        labels = ", ".join(str(item) for item in incomplete)
+    logs = {}
+    incomplete = []
+    for state in states.values():
+        stream_no = state["stream"]["stream"]
+        if state["total_chunks"] is None or len(state["chunks"]) != state["total_chunks"]:
+            logs[stream_no] = None
+            incomplete.append(stream_no)
+        else:
+            logs[stream_no] = [
+                seq for index in range(state["total_chunks"]) for seq in state["chunks"][index]
+            ]
+
+    if len(incomplete) == len(streams):
         print(
-            f"control: arrival log fetch incomplete for stream(s) {labels} "
-            f"(old server, or data path too lossy); directional stats unavailable"
+            "control: arrival log fetch failed for every stream "
+            "(old server, no path to it, or data path too lossy); directional stats unavailable"
         )
         return None
-
-    return {
-        state["stream"]["stream"]: [
-            seq for index in range(state["total_chunks"]) for seq in state["chunks"][index]
-        ]
-        for state in states.values()
-    }
+    if incomplete:
+        labels = ", ".join(str(item) for item in incomplete)
+        print(f"control: arrival log fetch incomplete for stream(s) {labels}; shown as unavailable")
+    return logs
 
 
 def make_icmp_packet(ident, seq, payload):
@@ -792,7 +810,12 @@ def fmt_seq_list(seqs, limit=20):
 
 
 def print_directional_stats(streams, logs):
-    summaries = [(stream, directional_summary(stream, logs[stream["stream"]])) for stream in streams]
+    unavailable = [stream for stream in streams if logs.get(stream["stream"]) is None]
+    summaries = [
+        (stream, directional_summary(stream, logs[stream["stream"]]))
+        for stream in streams
+        if logs.get(stream["stream"]) is not None
+    ]
     totals = {
         key: sum(summary[key] for _stream, summary in summaries)
         for key in ("sent", "reached", "verified", "forward_dup", "reorder_forward",
@@ -803,6 +826,9 @@ def print_directional_stats(streams, logs):
 
     print()
     print("--- directional statistics (server arrival log fetched in-band after the run) ---")
+    if unavailable:
+        labels = ", ".join(str(stream["stream"]) for stream in unavailable)
+        print(f"streams without arrival log (excluded from totals): {labels}")
 
     def print_block(label, summary, forward_lost, reverse_lost):
         sent = summary["sent"]
@@ -821,12 +847,18 @@ def print_directional_stats(streams, logs):
             f"forward_dup={summary['forward_dup']}"
         )
 
+    multi = len(streams) > 1
     if len(summaries) > 1:
         print_block("all streams: ", totals, totals["forward_lost"], totals["reverse_lost"])
     for stream, summary in summaries:
-        label = f"stream={stream['stream']} " if len(summaries) > 1 else ""
+        label = f"stream={stream['stream']} " if multi else ""
         print_block(label, summary, len(summary["forward_lost"]), len(summary["reverse_lost"]))
-        if summary["forward_lost"]:
+        if summary["sent"] and summary["reached"] == 0:
+            print(
+                f"{label}nothing reached the server on this port: forward path blocked "
+                f"(firewall / security group on port {stream.get('port', '?')}?)"
+            )
+        elif summary["forward_lost"]:
             print(f"{label}forward-lost seqs (never reached server): {fmt_seq_list(summary['forward_lost'])}")
         if summary["reverse_lost"]:
             print(f"{label}reverse-lost seqs (echo never returned): {fmt_seq_list(summary['reverse_lost'])}")
@@ -1236,6 +1268,8 @@ def assign_raw_tcp_source_ports(streams):
 def run_raw_tcp_client(args, dest_ip):
     streams, started = build_streams(args)
     assign_raw_tcp_source_ports(streams)
+    for stream in streams:
+        stream["port"] = stream_port(args, stream)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
     source_ports = {stream["src_port"] for stream in streams}
     source_ip = route_source_ip(dest_ip)

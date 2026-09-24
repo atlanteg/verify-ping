@@ -205,10 +205,19 @@ the server answers with chunk `k`. The client tracks which chunks it has and
 re-requests the missing ones until the log is complete or a deadline of
 `max(10 s, 3 × -W)` passes. A lost chunk just costs one more round trip.
 
-If the fetch cannot complete (old server without in-band support, or a path
-too lossy even for retries) the client prints a warning and falls back to
-round-trip statistics only. Use `--no-directional` to skip the fetch on
-purpose.
+The server keys arrival logs by run nonce, not by port. After the first
+round the client therefore retries a stream's chunks through the *other*
+streams' sockets, so a stream whose own port is firewalled still gets its
+verdict — typically `reached_server=0` with the note
+`nothing reached the server on this port: forward path blocked`. That is the
+quickest way to spot a security group that opened only the first port of a
+`-P` range.
+
+If a stream's log still cannot be completed it is reported as unavailable and
+left out of the totals; the other streams are shown normally. Only when no
+stream's log can be fetched at all (old server without in-band support, or a
+path too lossy even for retries) does the client fall back to round-trip
+statistics only. Use `--no-directional` to skip the fetch on purpose.
 
 ### Not available for ICMP and tcp-stream
 
