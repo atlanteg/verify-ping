@@ -142,8 +142,9 @@ TCP with a TWAMP-style scheme:
    order in which requests actually arrived at the server, before echoing.
 2. The server keeps an **arrival log** per stream (the sequence numbers it
    received, in arrival order), keyed by the run nonce.
-3. After the run, the client fetches that log over a reliable TCP **control
-   port** and reconciles it with what it sent and what it verified.
+3. After the run, the client fetches that log **in-band, over the same
+   socket and port the test used**, and reconciles it with what it sent and
+   what it verified. See [Fetching the arrival log](#fetching-the-arrival-log).
 
 Payload verification is unaffected: the stamp is normalized back to zero before
 the SHA-256 check, so the digest still covers the entire packet.
@@ -151,7 +152,7 @@ the SHA-256 check, so the digest still covers the entire packet.
 The client then reports, per stream and in total:
 
 ```text
---- directional statistics (server arrival log via control port 51001) ---
+--- directional statistics (server arrival log fetched in-band after the run) ---
 sent=40 reached_server=38 verified=36
 loss: forward=2 (5.000%) reverse=2 (5.000%) total=4 (10.000%)
 reorder: forward=1 reverse=1 end_to_end=2  forward_dup=0
@@ -177,20 +178,23 @@ reverse-lost seqs (echo never returned): 9, 30
 Reordering uses the RFC 4737 late-arrival definition: an entry counts as
 reordered when it is below the running maximum of the ordering key.
 
-### Control port
+### Fetching the arrival log
 
-The server opens a TCP control listener on `--control-port`; when omitted it
-defaults to the base data port + 1000 (data on `50001` → control on `51001`).
-Set it explicitly on both sides if that port is unavailable, and make sure it
-is reachable from the client:
+No extra port is needed. The fetch happens **only after the run** (once the
+`-W` wait for late replies has elapsed) and uses the very same UDP socket or
+raw TCP port pair the test ran on, so it crosses the same firewall rule and
+the same NAT mapping. Test traffic itself is unchanged.
 
-```sh
-./verify_ping.py --server --protocol udp --port 50001 --control-port 50999
-./verify_ping.py 10.200.200.1 --protocol udp --port 50001 --control-port 50999 -c 3000
-```
+The data path is lossy by definition, so the log is not sent as one message.
+The server serves it as independent ~1 KB **chunks** (512 sequence numbers
+each, below the usual MTU) and stays stateless: the client asks for chunk `k`,
+the server answers with chunk `k`. The client tracks which chunks it has and
+re-requests the missing ones until the log is complete or a deadline of
+`max(10 s, 3 × -W)` passes. A lost chunk just costs one more round trip.
 
-If the control port is unreachable the client prints a warning and falls back
-to round-trip statistics only. Use `--no-directional` to skip the fetch on
+If the fetch cannot complete (old server without in-band support, or a path
+too lossy even for retries) the client prints a warning and falls back to
+round-trip statistics only. Use `--no-directional` to skip the fetch on
 purpose.
 
 ### Not available for ICMP and tcp-stream
@@ -225,6 +229,8 @@ The sequence number is 16-bit, so one run is limited to `65535` packets per
 stream. Payloads must be at least `54` bytes (client header + server stamp) so
 each packet can carry the verification header.
 
-The wire format changed in 0.6.0 (`vpng3` magic, server stamp). Client and
-server must run the same major format; a 0.6 client talking to a 0.5 server
-reports "server did not stamp replies" and skips directional statistics.
+The wire format changed in 0.6.0 (`vpng3` magic, server stamp) and the arrival
+log moved in-band in 0.7.0 (the 0.6 TCP control port and `--control-port` are
+gone). Run the same version on both sides; against an older server the client
+reports that the arrival log fetch was incomplete and skips directional
+statistics.

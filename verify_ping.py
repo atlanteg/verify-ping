@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
-import json
 import os
 import random
 import selectors
 import socket
 import struct
 import sys
-import threading
 import time
 
 
@@ -28,9 +26,19 @@ STAMP_SIZE = struct.calcsize(STAMP_FMT)
 STAMP_OFFSET = CLIENT_HEADER_SIZE
 STAMP_END = STAMP_OFFSET + STAMP_SIZE
 PAYLOAD_HEADER_SIZE = STAMP_END
-# Control channel: reliable TCP side-channel the client uses after a run to
-# fetch the server's per-stream arrival log for directional attribution.
-DEFAULT_CONTROL_OFFSET = 1000
+# In-band control: after the run the client pulls the server's per-stream
+# arrival log over the SAME socket/port the test used (so it crosses the same
+# firewall hole and NAT mapping). The data path is lossy, so the log is served
+# as independent, idempotent chunks that the client re-requests until it has
+# them all (selective-repeat pull ARQ). The server stays stateless.
+CTRL_MAGIC = b"vpnc3\x00\x00\x00"
+CTRL_REQ_FMT = "!16sH"      # nonce, chunk index
+CTRL_REP_FMT = "!16sHHI"    # nonce, chunk index, total chunks, total entries
+CTRL_REQ_SIZE = len(CTRL_MAGIC) + struct.calcsize(CTRL_REQ_FMT)
+CTRL_REP_SIZE = len(CTRL_MAGIC) + struct.calcsize(CTRL_REP_FMT)
+CTRL_CHUNK_SEQS = 512       # 2 bytes each -> ~1 KB chunk, no IP fragmentation
+CTRL_WINDOW = 64            # outstanding chunk requests per round
+CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
 IPV4_HEADER_SIZE = 20
 RAW_TCP_HEADER_SIZE = 20
@@ -128,97 +136,141 @@ class ArrivalLog:
     """Server-side per-stream arrival accounting, keyed by run nonce."""
 
     def __init__(self):
-        self.lock = threading.Lock()
         self.arrivals = {}
 
     def record(self, nonce, seq):
-        with self.lock:
-            log = self.arrivals.setdefault(nonce, [])
-            log.append(seq)
-            return len(log)
+        log = self.arrivals.setdefault(nonce, [])
+        log.append(seq)
+        return len(log)
 
-    def dump(self, nonces):
-        with self.lock:
-            return {nonce.hex(): list(self.arrivals.get(nonce, [])) for nonce in nonces}
-
-
-def control_port_for(args):
-    return args.control_port if args.control_port else args.port + DEFAULT_CONTROL_OFFSET
-
-
-def send_control_message(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(data)) + data)
+    def chunk(self, nonce, index):
+        """Return (total_chunks, total_entries, seqs) for one chunk of a log."""
+        log = self.arrivals.get(nonce, [])
+        total = len(log)
+        total_chunks = max(1, (total + CTRL_CHUNK_SEQS - 1) // CTRL_CHUNK_SEQS)
+        start = index * CTRL_CHUNK_SEQS
+        return total_chunks, total, log[start:start + CTRL_CHUNK_SEQS]
 
 
-def recv_control_message(sock, timeout):
-    sock.settimeout(timeout)
-    header = b""
-    while len(header) < 4:
-        chunk = sock.recv(4 - len(header))
-        if not chunk:
-            raise ConnectionError("control connection closed")
-        header += chunk
-    length = struct.unpack("!I", header)[0]
-    if length > 64 << 20:
-        raise ConnectionError("control message too large")
-    body = b""
-    while len(body) < length:
-        chunk = sock.recv(min(65536, length - len(body)))
-        if not chunk:
-            raise ConnectionError("control connection closed")
-        body += chunk
-    return json.loads(body.decode("utf-8"))
+def make_ctrl_request(nonce, index):
+    return CTRL_MAGIC + struct.pack(CTRL_REQ_FMT, nonce, index)
 
 
-def start_control_server(args, arrival_log):
-    """Serve arrival logs over TCP in a daemon thread; returns bound port."""
-    port = control_port_for(args)
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        listener.bind((args.bind, port))
-    except OSError as exc:
-        raise SystemExit(f"control bind to {args.bind}:{port} failed: {exc}") from exc
-    listener.listen()
+def parse_ctrl_request(data):
+    if len(data) != CTRL_REQ_SIZE or not data.startswith(CTRL_MAGIC):
+        return None
+    nonce, index = struct.unpack_from(CTRL_REQ_FMT, data, len(CTRL_MAGIC))
+    return nonce, index
 
-    def serve():
-        while True:
+
+def make_ctrl_reply(nonce, index, total_chunks, total_entries, seqs):
+    return (
+        CTRL_MAGIC
+        + struct.pack(CTRL_REP_FMT, nonce, index, total_chunks, total_entries)
+        + struct.pack(f"!{len(seqs)}H", *seqs)
+    )
+
+
+def parse_ctrl_reply(data):
+    if len(data) < CTRL_REP_SIZE or not data.startswith(CTRL_MAGIC):
+        return None
+    nonce, index, total_chunks, total_entries = struct.unpack_from(
+        CTRL_REP_FMT, data, len(CTRL_MAGIC)
+    )
+    body = data[CTRL_REP_SIZE:]
+    if len(body) % 2:
+        return None
+    return {
+        "nonce": nonce,
+        "index": index,
+        "total_chunks": total_chunks,
+        "total_entries": total_entries,
+        "seqs": list(struct.unpack(f"!{len(body) // 2}H", body)),
+    }
+
+
+def serve_ctrl_request(arrival_log, data):
+    """Server side: answer one in-band chunk request, or None if not one."""
+    request = parse_ctrl_request(data)
+    if request is None:
+        return None
+    nonce, index = request
+    total_chunks, total_entries, seqs = arrival_log.chunk(nonce, index)
+    return make_ctrl_reply(nonce, index, total_chunks, total_entries, seqs)
+
+
+def fetch_arrival_logs(args, streams, send_request, recv_replies):
+    """Client side: pull each stream's arrival log over the data path.
+
+    send_request(stream, data) sends one control datagram for that stream;
+    recv_replies(timeout) returns raw control payloads received meanwhile.
+    Chunks are independent, so lost ones are simply requested again.
+    Returns {stream_no: [seqs in server arrival order]} or None on failure.
+    """
+    states = {
+        stream["nonce"]: {"stream": stream, "total_chunks": None, "total": None, "chunks": {}}
+        for stream in streams
+    }
+    deadline = time.monotonic() + max(10.0, args.timeout * 3)
+
+    while time.monotonic() < deadline:
+        wanted = []
+        for state in states.values():
+            if state["total_chunks"] is None:
+                wanted.append((state["stream"], 0))
+            else:
+                wanted.extend(
+                    (state["stream"], index)
+                    for index in range(state["total_chunks"])
+                    if index not in state["chunks"]
+                )
+        if not wanted:
+            break
+
+        for stream, index in wanted[:CTRL_WINDOW]:
             try:
-                conn, _addr = listener.accept()
+                send_request(stream, make_ctrl_request(stream["nonce"], index))
             except OSError:
-                return
-            try:
-                request = recv_control_message(conn, 10.0)
-                nonces = [bytes.fromhex(item) for item in request.get("nonces", [])]
-                send_control_message(conn, {"logs": arrival_log.dump(nonces)})
-            except (OSError, ValueError, ConnectionError):
                 pass
-            finally:
-                conn.close()
 
-    threading.Thread(target=serve, daemon=True).start()
-    return port
+        for data in recv_replies(CTRL_ROUND_WAIT):
+            reply = parse_ctrl_reply(data)
+            if reply is None:
+                continue
+            state = states.get(reply["nonce"])
+            if state is None:
+                continue
+            # A log that changed size between chunks (late arrivals) would be
+            # inconsistent; start that stream over rather than mix snapshots.
+            if state["total_chunks"] is not None and (
+                state["total_chunks"] != reply["total_chunks"]
+                or state["total"] != reply["total_entries"]
+            ):
+                state["chunks"].clear()
+            state["total_chunks"] = reply["total_chunks"]
+            state["total"] = reply["total_entries"]
+            if reply["index"] < reply["total_chunks"]:
+                state["chunks"][reply["index"]] = reply["seqs"]
 
-
-def fetch_arrival_logs(args, dest_ip, streams):
-    """Client side: pull the server arrival log for our streams. None on failure."""
-    port = control_port_for(args)
-    try:
-        sock = socket.create_connection((dest_ip, port), timeout=args.timeout)
-    except OSError as exc:
-        print(f"control: cannot reach {dest_ip}:{port} ({exc}); directional stats unavailable")
+    incomplete = [
+        state["stream"]["stream"]
+        for state in states.values()
+        if state["total_chunks"] is None or len(state["chunks"]) != state["total_chunks"]
+    ]
+    if incomplete:
+        labels = ", ".join(str(item) for item in incomplete)
+        print(
+            f"control: arrival log fetch incomplete for stream(s) {labels} "
+            f"(old server, or data path too lossy); directional stats unavailable"
+        )
         return None
-    try:
-        send_control_message(sock, {"nonces": [stream["nonce"].hex() for stream in streams]})
-        reply = recv_control_message(sock, max(args.timeout, 5.0))
-    except (OSError, ValueError, ConnectionError) as exc:
-        print(f"control: fetch from {dest_ip}:{port} failed ({exc}); directional stats unavailable")
-        return None
-    finally:
-        sock.close()
-    logs = reply.get("logs", {})
-    return {stream["stream"]: logs.get(stream["nonce"].hex(), []) for stream in streams}
+
+    return {
+        state["stream"]["stream"]: [
+            seq for index in range(state["total_chunks"]) for seq in state["chunks"][index]
+        ]
+        for state in states.values()
+    }
 
 
 def make_icmp_packet(ident, seq, payload):
@@ -471,15 +523,9 @@ def parse_args():
     parser.add_argument("--progress", type=int, default=100, help="print progress every N verified replies")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
     parser.add_argument(
-        "--control-port",
-        type=int,
-        default=None,
-        help=f"TCP control port for directional stats (default: port + {DEFAULT_CONTROL_OFFSET})",
-    )
-    parser.add_argument(
         "--no-directional",
         action="store_true",
-        help="skip the post-run control fetch; report round-trip stats only",
+        help="skip the post-run arrival log fetch; report round-trip stats only",
     )
     return parser.parse_args()
 
@@ -525,22 +571,6 @@ def validate_args(args):
             raise SystemExit(
                 f"port range {args.port}..{last_port} exceeds 65535; reduce --parallel or --port"
             )
-
-    if args.protocol in CONTROL_PROTOCOLS:
-        if args.control_port is not None and not (1 <= args.control_port <= 65535):
-            raise SystemExit("control port must be between 1 and 65535")
-        control_port = control_port_for(args)
-        if control_port > 65535:
-            raise SystemExit(
-                f"default control port {control_port} exceeds 65535; set --control-port explicitly"
-            )
-        first_port = args.port
-        last_port = args.port + args.parallel - 1
-        if first_port <= control_port <= last_port:
-            raise SystemExit(
-                f"control port {control_port} collides with data ports {first_port}..{last_port}"
-            )
-
 
 def build_streams(args):
     base_ident = os.getpid() & 0xFFFF
@@ -612,7 +642,9 @@ def print_client_header(args, dest_ip, streams):
     )
 
 
-def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected):
+def print_client_stats(
+    args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs=None
+):
     sent_total = sum(stream["sent"] for stream in streams)
     verified_total = sum(stream["verified"] for stream in streams)
     lost = len(pending)
@@ -662,7 +694,8 @@ def print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates
             print(f"bad payload: ... {len(bad) - 20} more")
 
     if args.protocol in CONTROL_PROTOCOLS and not args.no_directional:
-        print_directional_stats(args, dest_ip, streams)
+        if arrival_logs is not None:
+            print_directional_stats(streams, arrival_logs)
     elif args.protocol == "icmp":
         print("directional stats: n/a for icmp (echo comes from the remote OS, no arrival log)")
     elif args.protocol == "tcp-stream":
@@ -708,17 +741,7 @@ def fmt_seq_list(seqs, limit=20):
     return shown + (" ..." if len(seqs) > limit else "")
 
 
-def print_directional_stats(args, dest_ip, streams):
-    logs = fetch_arrival_logs(args, dest_ip, streams)
-    if logs is None:
-        return
-
-    if all(rseq == 0 for stream in streams for _seq, rseq in stream["replies"]) and any(
-        stream["replies"] for stream in streams
-    ):
-        print("directional stats: server did not stamp replies (old server version?); unavailable")
-        return
-
+def print_directional_stats(streams, logs):
     summaries = [(stream, directional_summary(stream, logs[stream["stream"]])) for stream in streams]
     totals = {
         key: sum(summary[key] for _stream, summary in summaries)
@@ -729,7 +752,7 @@ def print_directional_stats(args, dest_ip, streams):
     totals["reverse_lost"] = sum(len(summary["reverse_lost"]) for _stream, summary in summaries)
 
     print()
-    print(f"--- directional statistics (server arrival log via control port {control_port_for(args)}) ---")
+    print("--- directional statistics (server arrival log fetched in-band after the run) ---")
 
     def print_block(label, summary, forward_lost, reverse_lost):
         sent = summary["sent"]
@@ -974,6 +997,8 @@ def run_udp_client(args, dest_ip):
                     break
                 except OSError:
                     break
+                if payload.startswith(CTRL_MAGIC):
+                    continue
 
                 result = verify_payload(
                     payload,
@@ -999,10 +1024,40 @@ def run_udp_client(args, dest_ip):
         if should_stop_waiting(args, streams, pending, target_total):
             break
 
+    arrival_logs = None
+    if not args.no_directional:
+        # Pull the arrival log over the same connected sockets the test used.
+        def send_request(stream, data):
+            stream["sock"].send(data)
+
+        def recv_replies(wait):
+            replies = []
+            end = time.monotonic() + wait
+            while True:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                events = selector.select(remaining)
+                if not events:
+                    break
+                for key, _mask in events:
+                    while True:
+                        try:
+                            data = key.fileobj.recv(UDP_MAX_PAYLOAD)
+                        except OSError:
+                            break
+                        if data.startswith(CTRL_MAGIC):
+                            replies.append(data)
+            return replies
+
+        arrival_logs = fetch_arrival_logs(args, streams, send_request, recv_replies)
+
     for stream in streams:
         stream["sock"].close()
 
-    return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
+    return print_client_stats(
+        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs
+    )
 
 
 def run_tcp_stream_client(args, dest_ip):
@@ -1141,6 +1196,7 @@ def run_raw_tcp_client(args, dest_ip):
     duplicates = 0
     unexpected = 0
     verified_total = 0
+    arrival_logs = None
 
     recv_sock, send_sock = open_raw_tcp_sockets()
     selector = selectors.DefaultSelector()
@@ -1223,11 +1279,53 @@ def run_raw_tcp_client(args, dest_ip):
 
             if should_stop_waiting(args, streams, pending, target_total):
                 break
+
+        if not args.no_directional:
+            # Pull the arrival log as raw segments on the same ports the test used.
+            def send_request(stream, data):
+                packet = make_raw_tcp_packet(
+                    source_ip,
+                    dest_ip,
+                    stream["src_port"],
+                    stream_port(args, stream),
+                    0,
+                    0,
+                    TCP_PSH | TCP_ACK,
+                    data,
+                )
+                sendto_with_retry(send_sock, packet, (dest_ip, 0), args.timeout)
+
+            def recv_replies(wait):
+                replies = []
+                end = time.monotonic() + wait
+                while True:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        break
+                    while True:
+                        try:
+                            packet, _addr = recv_sock.recvfrom(65535)
+                        except BlockingIOError:
+                            break
+                        parsed = parse_ipv4_tcp_packet(packet)
+                        if (
+                            parsed
+                            and parsed["src_ip"] == dest_ip
+                            and args.port <= parsed["src_port"] <= args.port + args.parallel - 1
+                            and parsed["dest_port"] in source_ports
+                            and parsed["payload"].startswith(CTRL_MAGIC)
+                        ):
+                            replies.append(parsed["payload"])
+                return replies
+
+            arrival_logs = fetch_arrival_logs(args, streams, send_request, recv_replies)
     finally:
         recv_sock.close()
         send_sock.close()
 
-    return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
+    return print_client_stats(
+        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs
+    )
 
 
 def run_raw_tcp_server(args):
@@ -1235,10 +1333,9 @@ def run_raw_tcp_server(args):
     first_port = args.port
     last_port = args.port + args.parallel - 1
     arrival_log = ArrivalLog()
-    control_port = start_control_server(args, arrival_log)
     print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
-    print(f"control port {control_port}/tcp serves arrival logs for directional stats", flush=True)
+    print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
     try:
         while True:
@@ -1253,17 +1350,18 @@ def run_raw_tcp_server(args):
                 continue
             if not (first_port <= parsed["dest_port"] <= last_port):
                 continue
-            if not parsed["payload"].startswith(MAGIC):
-                continue
             if args.bind != "0.0.0.0" and parsed["dest_ip"] != args.bind:
                 continue
 
-            payload_meta = parse_payload(parsed["payload"])
-            if not payload_meta:
-                continue
-
-            rseq = arrival_log.record(payload_meta["nonce"], payload_meta["seq"])
-            echo_payload = stamp_payload(parsed["payload"], rseq, time.monotonic_ns())
+            echo_payload = serve_ctrl_request(arrival_log, parsed["payload"])
+            if echo_payload is None:
+                if not parsed["payload"].startswith(MAGIC):
+                    continue
+                payload_meta = parse_payload(parsed["payload"])
+                if not payload_meta:
+                    continue
+                rseq = arrival_log.record(payload_meta["nonce"], payload_meta["seq"])
+                echo_payload = stamp_payload(parsed["payload"], rseq, time.monotonic_ns())
             ack = (parsed["seq"] + len(parsed["payload"])) & 0xFFFFFFFF
             reply = make_raw_tcp_packet(
                 parsed["dest_ip"],
@@ -1303,10 +1401,9 @@ def run_udp_server(args):
         sockets.append(sock)
 
     arrival_log = ArrivalLog()
-    control_port = start_control_server(args, arrival_log)
     actual_host = sockets[0].getsockname()[0]
     print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
-    print(f"control port {control_port}/tcp serves arrival logs for directional stats", flush=True)
+    print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
     try:
         while True:
@@ -1317,6 +1414,10 @@ def run_udp_server(args):
                     except BlockingIOError:
                         break
                     if not data:
+                        continue
+                    ctrl_reply = serve_ctrl_request(arrival_log, data)
+                    if ctrl_reply is not None:
+                        key.fileobj.sendto(ctrl_reply, addr)
                         continue
                     meta = parse_payload(data)
                     if meta:
