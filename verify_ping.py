@@ -1850,8 +1850,10 @@ def run_udp_reverse_client(args, dest_ip):
         if expected_end is None and (len(acked) == len(streams) or now >= handshake_deadline):
             if not acked:
                 raise SystemExit(
-                    "server never acknowledged the -R start on any stream "
-                    "(old server without -R support, or ports blocked toward it)"
+                    "server never acknowledged the -R start on any stream: either the server "
+                    "is too old for -R, or this host cannot reach it. Note that -R does not "
+                    "change who connects: run the client on the side that can reach the other "
+                    "one, and the server will probe back through the same path"
                 )
             expected_end = now + args.count * args.interval + args.timeout
             next_poll = expected_end

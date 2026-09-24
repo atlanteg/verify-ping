@@ -112,7 +112,12 @@ including kernel-generated RST packets, are ignored by the verifier.
 Like `iperf3 -R`: the client still initiates everything (so it works from
 behind NAT and only the server needs an open port), but then the **roles
 swap** — the server sends the probes and this client echoes them. The report
-is still printed on the client:
+is still printed on the client.
+
+`-R` does **not** change which side connects. If host A can reach host B but
+not the other way round, the client always runs on A; without `-R` A probes
+B, with `-R` B probes A through the path A opened. Use `-R` when you want the
+unreachable side to be the sender:
 
 ```sh
 ./verify_ping.py --server --protocol udp --port 50001 -P 4      # remote, unchanged
