@@ -21,6 +21,8 @@ packets: forward (client → server) or reverse (server → client). See
 - Parallel measurement streams with separate verification identifiers
 - Reports lost requests, bad payloads, duplicates, and unexpected replies
 - Per-direction loss, reordering, and duplication attribution (UDP, raw TCP)
+- Reverse mode (`-R`, like `iperf3 -R`): the server probes, the client echoes (UDP)
+- Live progress on both sides; no extra ports beyond the test ports
 - No third-party Python dependencies
 
 ## Requirements
