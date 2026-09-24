@@ -105,6 +105,45 @@ headers manually, sends standalone TCP segments with payload, and the responder
 echoes matching test payloads back as raw TCP segments. Non-test TCP packets,
 including kernel-generated RST packets, are ignored by the verifier.
 
+### Reverse mode (`-R`)
+
+Like `iperf3 -R`: the client still initiates everything (so it works from
+behind NAT and only the server needs an open port), but then the **roles
+swap** — the server sends the probes and this client echoes them. The report
+is still printed on the client:
+
+```sh
+./verify_ping.py --server --protocol udp --port 50001 -P 4      # remote, unchanged
+./verify_ping.py 10.200.200.1 --protocol udp --port 50001 -P 4 -c 3000 -i 0.08 -s 1200 -R
+```
+
+The client sends an in-band start request per stream (count, interval, size,
+`-W`) and retries it until the server acknowledges; the server then runs the
+same prober state machine the client normally runs (unique payloads, SHA-256
+verification of each echo, reply order) toward the client's address. While
+the run lasts the client prints the per-second `rx=` line, since it is now the
+echo side. Afterwards it pulls the server's reply log and summary in-band and
+combines them with its own arrival log, so the directional block reads with
+the roles swapped: **forward = server → client, reverse = client → server**.
+
+```text
+--- 10.200.200.1:50001 verified udp statistics (-R: server probes, client echoes) ---
+streams=1 count_per_stream=40 sent=40 verified=36 lost=4 bad_payload=0 loss=10.000% duplicates=0 unexpected=0
+
+note: -R swaps the roles, so below forward = server -> client and reverse = client -> server
+
+--- directional statistics (client arrival log fetched in-band after the run) ---
+sent=40 reached_client=38 verified=36
+loss: forward=2 (5.000%) reverse=2 (5.000%) total=4 (10.000%)
+reorder: forward=1 reverse=1 end_to_end=2  forward_dup=0
+forward-lost seqs (never reached client): 9, 30
+reverse-lost seqs (echo never returned): 5, 17
+```
+
+A stream whose start is never acknowledged (its port is blocked toward the
+server, or the server is too old) is reported as such and skipped. `-R` is
+currently UDP only.
+
 ### TCP Stream
 
 The older application-level TCP stream echo mode is still available as
@@ -251,8 +290,10 @@ The sequence number is 16-bit, so one run is limited to `65535` packets per
 stream. Payloads must be at least `54` bytes (client header + server stamp) so
 each packet can carry the verification header.
 
-The wire format changed in 0.6.0 (`vpng3` magic, server stamp) and the arrival
+The wire format changed in 0.6.0 (`vpng3` magic, server stamp), the arrival
 log moved in-band in 0.7.0 (the 0.6 TCP control port and `--control-port` are
-gone). Run the same version on both sides; against an older server the client
-reports that the arrival log fetch was incomplete and skips directional
+gone), and the in-band control messages gained a type byte and log kinds in
+0.8.0 (`vpnc4`, for `-R`). Run the same version on both sides; against an
+older server the client reports that the log fetch was incomplete (or, under
+`-R`, that the start was never acknowledged) and skips directional
 statistics.

@@ -31,15 +31,33 @@ PAYLOAD_HEADER_SIZE = STAMP_END
 # firewall hole and NAT mapping). The data path is lossy, so the log is served
 # as independent, idempotent chunks that the client re-requests until it has
 # them all (selective-repeat pull ARQ). The server stays stateless.
-CTRL_MAGIC = b"vpnc3\x00\x00\x00"
-CTRL_REQ_FMT = "!16sH"      # nonce, chunk index
-CTRL_REP_FMT = "!16sHHI"    # nonce, chunk index, total chunks, total entries
-CTRL_REQ_SIZE = len(CTRL_MAGIC) + struct.calcsize(CTRL_REQ_FMT)
-CTRL_REP_SIZE = len(CTRL_MAGIC) + struct.calcsize(CTRL_REP_FMT)
-CTRL_CHUNK_SEQS = 512       # 2 bytes each -> ~1 KB chunk, no IP fragmentation
+CTRL_MAGIC = b"vpnc4\x00\x00\x00"
+# Message type byte follows the magic.
+CTRL_CHUNK_REQ = 1          # pull one chunk of a log:      nonce, kind, index
+CTRL_CHUNK_REP = 2          # one chunk:                    nonce, kind, index, total chunks, total entries, entries
+CTRL_START = 3              # -R: ask the server to probe:  nonce, ident, stream, count, interval_us, size, timeout_ms
+CTRL_START_ACK = 4          # -R: server accepted the run:  nonce
+CTRL_REQ_FMT = "!16sBH"
+CTRL_REP_FMT = "!16sBHHI"
+CTRL_START_FMT = "!16sHHHIHI"
+CTRL_ACK_FMT = "!16s"
+CTRL_TYPE_OFFSET = len(CTRL_MAGIC)
+CTRL_BODY_OFFSET = CTRL_TYPE_OFFSET + 1
+CTRL_REQ_SIZE = CTRL_BODY_OFFSET + struct.calcsize(CTRL_REQ_FMT)
+CTRL_REP_SIZE = CTRL_BODY_OFFSET + struct.calcsize(CTRL_REP_FMT)
+CTRL_START_SIZE = CTRL_BODY_OFFSET + struct.calcsize(CTRL_START_FMT)
+CTRL_ACK_SIZE = CTRL_BODY_OFFSET + struct.calcsize(CTRL_ACK_FMT)
+# Log kinds a chunk request can ask for. Entries are fixed-size records, and
+# a chunk stays around 1 KB so it never needs IP fragmentation.
+KIND_ARRIVALS = 0           # echo side: seqs in arrival order            (!H)
+KIND_REPLIES = 1            # probe side: (seq, rseq) in reply order      (!HI)
+KIND_SUMMARY = 2            # probe side: sent, verified, bad, dup, unexpected, done
+KIND_ENTRY_FMT = {KIND_ARRIVALS: "!H", KIND_REPLIES: "!HI", KIND_SUMMARY: "!HHHHHB"}
+KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1}
 CTRL_WINDOW = 64            # outstanding chunk requests per round
 CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
+REVERSE_PROTOCOLS = ("udp",)
 IPV4_HEADER_SIZE = 20
 RAW_TCP_HEADER_SIZE = 20
 RAW_TCP_MAX_PAYLOAD = 65535 - IPV4_HEADER_SIZE - RAW_TCP_HEADER_SIZE
@@ -132,8 +150,17 @@ def count_reordered(keys):
     return reordered
 
 
+def chunk_of(entries, kind, index):
+    """Slice a log into fixed-size chunks: (total_chunks, total_entries, part)."""
+    per_chunk = KIND_CHUNK_ENTRIES[kind]
+    total = len(entries)
+    total_chunks = max(1, (total + per_chunk - 1) // per_chunk)
+    start = index * per_chunk
+    return total_chunks, total, entries[start:start + per_chunk]
+
+
 class ArrivalLog:
-    """Server-side per-stream arrival accounting, keyed by run nonce."""
+    """Echo-side per-stream arrival accounting, keyed by run nonce."""
 
     def __init__(self):
         self.arrivals = {}
@@ -143,13 +170,10 @@ class ArrivalLog:
         log.append(seq)
         return len(log)
 
-    def chunk(self, nonce, index):
-        """Return (total_chunks, total_entries, seqs) for one chunk of a log."""
-        log = self.arrivals.get(nonce, [])
-        total = len(log)
-        total_chunks = max(1, (total + CTRL_CHUNK_SEQS - 1) // CTRL_CHUNK_SEQS)
-        start = index * CTRL_CHUNK_SEQS
-        return total_chunks, total, log[start:start + CTRL_CHUNK_SEQS]
+    def chunk(self, nonce, kind, index):
+        if kind != KIND_ARRIVALS:
+            return None
+        return chunk_of(self.arrivals.get(nonce, []), kind, index)
 
 
 class ServerProgress:
@@ -197,64 +221,223 @@ class ServerProgress:
         self.window = 0
 
 
-def make_ctrl_request(nonce, index):
-    return CTRL_MAGIC + struct.pack(CTRL_REQ_FMT, nonce, index)
+class ProbeSession:
+    """-R on the server: one stream the server probes toward a client that asked.
+
+    Mirrors the normal client's prober state (pending, verification, reply
+    order) so the client can later pull KIND_REPLIES / KIND_SUMMARY and run
+    the same directional maths with the roles swapped.
+    """
+
+    def __init__(self, start, sock, addr):
+        now = time.monotonic()
+        self.sock = sock
+        self.addr = addr
+        self.nonce = start["nonce"]
+        self.count = start["count"]
+        self.interval = start["interval"]
+        self.size = start["size"]
+        self.timeout = start["timeout"]
+        self.stream = {
+            "stream": start["stream"],
+            "ident": start["ident"],
+            "nonce": self.nonce,
+            "sent": 0,
+            "verified": 0,
+            "bad": 0,
+            "next_send": now,
+            "last_send": None,
+            "replies": [],
+        }
+        self.pending = {}
+        self.completed = {}
+        self.bad = []
+        self.duplicates = 0
+        self.unexpected = 0
+        self.done = False
+        self.done_at = None
+
+    def next_wakeup(self, now):
+        if self.done or self.stream["sent"] >= self.count:
+            return None
+        return max(0.0, self.stream["next_send"] - now)
+
+    def pump(self, now):
+        """Send due probes; mark done once all are sent and answered or timed out."""
+        stream = self.stream
+        while not self.done and stream["sent"] < self.count and now >= stream["next_send"]:
+            seq = stream["sent"] + 1
+            payload = make_payload(
+                self.size, stream["ident"], stream["stream"], seq, seq, time.monotonic_ns(), self.nonce
+            )
+            try:
+                self.sock.sendto(payload, self.addr)
+            except OSError:
+                pass
+            record_pending(self.pending, stream, seq, payload, self.interval)
+            now = time.monotonic()
+        if not self.done and stream["sent"] >= self.count:
+            if not self.pending or (
+                stream["last_send"] is not None and now - stream["last_send"] >= self.timeout
+            ):
+                self.done = True
+                self.done_at = now
+
+    def on_echo(self, payload, source):
+        result = verify_payload(
+            payload, source, {self.stream["ident"]: self.stream}, self.pending, self.completed, self.bad
+        )
+        if result == "duplicate":
+            self.duplicates += 1
+        elif result == "unexpected":
+            self.unexpected += 1
+
+    def chunk(self, kind, index):
+        if kind == KIND_REPLIES:
+            return chunk_of(self.stream["replies"], kind, index)
+        if kind == KIND_SUMMARY:
+            stream = self.stream
+            record = (
+                stream["sent"],
+                stream["verified"],
+                min(len(self.bad), 0xFFFF),
+                min(self.duplicates, 0xFFFF),
+                min(self.unexpected, 0xFFFF),
+                1 if self.done else 0,
+            )
+            return chunk_of([record], kind, index)
+        return None
+
+
+def ctrl_type(data):
+    if len(data) <= CTRL_TYPE_OFFSET or not data.startswith(CTRL_MAGIC):
+        return None
+    return data[CTRL_TYPE_OFFSET]
+
+
+def make_ctrl_request(nonce, kind, index):
+    return CTRL_MAGIC + bytes([CTRL_CHUNK_REQ]) + struct.pack(CTRL_REQ_FMT, nonce, kind, index)
 
 
 def parse_ctrl_request(data):
-    if len(data) != CTRL_REQ_SIZE or not data.startswith(CTRL_MAGIC):
+    if ctrl_type(data) != CTRL_CHUNK_REQ or len(data) != CTRL_REQ_SIZE:
         return None
-    nonce, index = struct.unpack_from(CTRL_REQ_FMT, data, len(CTRL_MAGIC))
-    return nonce, index
+    nonce, kind, index = struct.unpack_from(CTRL_REQ_FMT, data, CTRL_BODY_OFFSET)
+    if kind not in KIND_ENTRY_FMT:
+        return None
+    return nonce, kind, index
 
 
-def make_ctrl_reply(nonce, index, total_chunks, total_entries, seqs):
+def pack_entries(kind, entries):
+    fmt = KIND_ENTRY_FMT[kind]
+    return b"".join(
+        struct.pack(fmt, *(entry if isinstance(entry, tuple) else (entry,))) for entry in entries
+    )
+
+
+def unpack_entries(kind, body):
+    fmt = KIND_ENTRY_FMT[kind]
+    if len(body) % struct.calcsize(fmt):
+        return None
+    records = list(struct.iter_unpack(fmt, body))
+    if kind == KIND_ARRIVALS:
+        return [record[0] for record in records]
+    return records
+
+
+def make_ctrl_reply(nonce, kind, index, total_chunks, total_entries, entries):
     return (
         CTRL_MAGIC
-        + struct.pack(CTRL_REP_FMT, nonce, index, total_chunks, total_entries)
-        + struct.pack(f"!{len(seqs)}H", *seqs)
+        + bytes([CTRL_CHUNK_REP])
+        + struct.pack(CTRL_REP_FMT, nonce, kind, index, total_chunks, total_entries)
+        + pack_entries(kind, entries)
     )
 
 
 def parse_ctrl_reply(data):
-    if len(data) < CTRL_REP_SIZE or not data.startswith(CTRL_MAGIC):
+    if ctrl_type(data) != CTRL_CHUNK_REP or len(data) < CTRL_REP_SIZE:
         return None
-    nonce, index, total_chunks, total_entries = struct.unpack_from(
-        CTRL_REP_FMT, data, len(CTRL_MAGIC)
+    nonce, kind, index, total_chunks, total_entries = struct.unpack_from(
+        CTRL_REP_FMT, data, CTRL_BODY_OFFSET
     )
-    body = data[CTRL_REP_SIZE:]
-    if len(body) % 2:
+    if kind not in KIND_ENTRY_FMT:
+        return None
+    entries = unpack_entries(kind, data[CTRL_REP_SIZE:])
+    if entries is None:
         return None
     return {
         "nonce": nonce,
+        "kind": kind,
         "index": index,
         "total_chunks": total_chunks,
         "total_entries": total_entries,
-        "seqs": list(struct.unpack(f"!{len(body) // 2}H", body)),
+        "entries": entries,
     }
 
 
-def serve_ctrl_request(arrival_log, data):
-    """Server side: answer one in-band chunk request, or None if not one."""
+def make_ctrl_start(nonce, ident, stream, count, interval_us, size, timeout_ms):
+    return (
+        CTRL_MAGIC
+        + bytes([CTRL_START])
+        + struct.pack(CTRL_START_FMT, nonce, ident, stream, count, interval_us, size, timeout_ms)
+    )
+
+
+def parse_ctrl_start(data):
+    if ctrl_type(data) != CTRL_START or len(data) != CTRL_START_SIZE:
+        return None
+    nonce, ident, stream, count, interval_us, size, timeout_ms = struct.unpack_from(
+        CTRL_START_FMT, data, CTRL_BODY_OFFSET
+    )
+    return {
+        "nonce": nonce,
+        "ident": ident,
+        "stream": stream,
+        "count": count,
+        "interval": interval_us / 1e6,
+        "size": size,
+        "timeout": timeout_ms / 1e3,
+    }
+
+
+def make_ctrl_ack(nonce):
+    return CTRL_MAGIC + bytes([CTRL_START_ACK]) + struct.pack(CTRL_ACK_FMT, nonce)
+
+
+def parse_ctrl_ack(data):
+    if ctrl_type(data) != CTRL_START_ACK or len(data) != CTRL_ACK_SIZE:
+        return None
+    return struct.unpack_from(CTRL_ACK_FMT, data, CTRL_BODY_OFFSET)[0]
+
+
+def serve_ctrl_request(chunk_fn, data):
+    """Answer one in-band chunk request via chunk_fn(nonce, kind, index); None if not one."""
     request = parse_ctrl_request(data)
     if request is None:
         return None
-    nonce, index = request
-    total_chunks, total_entries, seqs = arrival_log.chunk(nonce, index)
-    return make_ctrl_reply(nonce, index, total_chunks, total_entries, seqs)
+    nonce, kind, index = request
+    result = chunk_fn(nonce, kind, index)
+    if result is None:
+        return None
+    total_chunks, total_entries, entries = result
+    return make_ctrl_reply(nonce, kind, index, total_chunks, total_entries, entries)
 
 
 def fetch_arrival_logs(args, streams, send_request, recv_replies):
-    """Client side: pull each stream's arrival log over the data path.
+    return fetch_logs(args, streams, send_request, recv_replies, KIND_ARRIVALS)
+
+
+def fetch_logs(args, streams, send_request, recv_replies, kind, budget=None):
+    """Pull one kind of log for each stream over the data path.
 
     send_request(carrier, data) sends one control datagram on the carrier
     stream's socket/port; recv_replies(timeout) returns raw control payloads
     received meanwhile. Chunks are independent, so lost ones are simply
-    requested again. The server keys logs by nonce, not by port, so after the
-    first round a stream whose own port is blocked is retried through the
+    requested again. The far side keys logs by nonce, not by port, so after
+    the first round a stream whose own port is blocked is retried through the
     other streams' sockets; that is how a firewalled port still gets its
     "nothing reached the server" verdict.
-    Returns {stream_no: [seqs in server arrival order] or None if unavailable}.
+    Returns {stream_no: entries or None if unavailable}.
     """
     states = {
         stream["nonce"]: {
@@ -266,7 +449,10 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
         }
         for stream in streams
     }
-    deadline = time.monotonic() + max(10.0, args.timeout * 3)
+    if budget is None:
+        budget = max(10.0, args.timeout * 3)
+    deadline = time.monotonic() + budget
+    label = {KIND_ARRIVALS: "arrival log", KIND_REPLIES: "reply log", KIND_SUMMARY: "summary"}[kind]
 
     while time.monotonic() < deadline:
         wanted = []
@@ -287,7 +473,7 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
             position = streams.index(stream)
             carrier = streams[(position + state["attempt"]) % len(streams)]
             try:
-                send_request(carrier, make_ctrl_request(stream["nonce"], index))
+                send_request(carrier, make_ctrl_request(stream["nonce"], kind, index))
             except OSError:
                 pass
         for state, _index in wanted:
@@ -298,7 +484,7 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
             if reply is None:
                 continue
             state = states.get(reply["nonce"])
-            if state is None:
+            if state is None or reply["kind"] != kind:
                 continue
             # A log that changed size between chunks (late arrivals) would be
             # inconsistent; start that stream over rather than mix snapshots.
@@ -310,7 +496,7 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
             state["total_chunks"] = reply["total_chunks"]
             state["total"] = reply["total_entries"]
             if reply["index"] < reply["total_chunks"]:
-                state["chunks"][reply["index"]] = reply["seqs"]
+                state["chunks"][reply["index"]] = reply["entries"]
 
     logs = {}
     incomplete = []
@@ -326,13 +512,13 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
 
     if len(incomplete) == len(streams):
         print(
-            "control: arrival log fetch failed for every stream "
-            "(old server, no path to it, or data path too lossy); directional stats unavailable"
+            f"control: {label} fetch failed for every stream "
+            f"(old server, no path to it, or data path too lossy); directional stats unavailable"
         )
         return None
     if incomplete:
         labels = ", ".join(str(item) for item in incomplete)
-        print(f"control: arrival log fetch incomplete for stream(s) {labels}; shown as unavailable")
+        print(f"control: {label} fetch incomplete for stream(s) {labels}; shown as unavailable")
     return logs
 
 
@@ -595,6 +781,13 @@ def parse_args():
         action="store_true",
         help="skip the post-run arrival log fetch; report round-trip stats only",
     )
+    parser.add_argument(
+        "-R",
+        "--reverse",
+        action="store_true",
+        help="reverse roles: connect as usual, then the server probes and this client echoes; "
+        "the report is still printed here (udp only)",
+    )
     return parser.parse_args()
 
 
@@ -603,6 +796,10 @@ def validate_args(args):
         raise SystemExit("ICMP echo replies are provided by the OS; --server is only for UDP/TCP")
     if not args.server and not args.host:
         raise SystemExit("host is required in client mode")
+    if args.reverse and args.server:
+        raise SystemExit("-R is a client option; the server side needs no flag")
+    if args.reverse and args.protocol not in REVERSE_PROTOCOLS:
+        raise SystemExit(f"-R is supported for {', '.join(REVERSE_PROTOCOLS)} only")
     if args.count < 1:
         raise SystemExit("count must be positive")
     if args.count > 65535:
@@ -809,7 +1006,8 @@ def fmt_seq_list(seqs, limit=20):
     return shown + (" ..." if len(seqs) > limit else "")
 
 
-def print_directional_stats(streams, logs):
+def print_directional_stats(streams, logs, far="server"):
+    """far names the echo side: 'server' normally, 'client' under -R."""
     unavailable = [stream for stream in streams if logs.get(stream["stream"]) is None]
     summaries = [
         (stream, directional_summary(stream, logs[stream["stream"]]))
@@ -825,7 +1023,7 @@ def print_directional_stats(streams, logs):
     totals["reverse_lost"] = sum(len(summary["reverse_lost"]) for _stream, summary in summaries)
 
     print()
-    print("--- directional statistics (server arrival log fetched in-band after the run) ---")
+    print(f"--- directional statistics ({far} arrival log fetched in-band after the run) ---")
     if unavailable:
         labels = ", ".join(str(stream["stream"]) for stream in unavailable)
         print(f"streams without arrival log (excluded from totals): {labels}")
@@ -834,7 +1032,7 @@ def print_directional_stats(streams, logs):
         sent = summary["sent"]
         total_lost = forward_lost + reverse_lost
         print(
-            f"{label}sent={sent} reached_server={summary['reached']} verified={summary['verified']}"
+            f"{label}sent={sent} reached_{far}={summary['reached']} verified={summary['verified']}"
         )
         print(
             f"{label}loss: forward={forward_lost} ({loss_percent(sent, forward_lost):.3f}%) "
@@ -855,11 +1053,11 @@ def print_directional_stats(streams, logs):
         print_block(label, summary, len(summary["forward_lost"]), len(summary["reverse_lost"]))
         if summary["sent"] and summary["reached"] == 0:
             print(
-                f"{label}nothing reached the server on this port: forward path blocked "
+                f"{label}nothing reached the {far} on this port: forward path blocked "
                 f"(firewall / security group on port {stream.get('port', '?')}?)"
             )
         elif summary["forward_lost"]:
-            print(f"{label}forward-lost seqs (never reached server): {fmt_seq_list(summary['forward_lost'])}")
+            print(f"{label}forward-lost seqs (never reached {far}): {fmt_seq_list(summary['forward_lost'])}")
         if summary["reverse_lost"]:
             print(f"{label}reverse-lost seqs (echo never returned): {fmt_seq_list(summary['reverse_lost'])}")
 
@@ -1439,7 +1637,7 @@ def run_raw_tcp_server(args):
             if args.bind != "0.0.0.0" and parsed["dest_ip"] != args.bind:
                 continue
 
-            echo_payload = serve_ctrl_request(arrival_log, parsed["payload"])
+            echo_payload = serve_ctrl_request(arrival_log.chunk, parsed["payload"])
             if echo_payload is None:
                 if not parsed["payload"].startswith(MAGIC):
                     continue
@@ -1488,14 +1686,28 @@ def run_udp_server(args):
         sockets.append(sock)
 
     arrival_log = ArrivalLog()
+    sessions = {}  # -R runs we are probing, keyed by client nonce
     progress = ServerProgress(args.progress > 0)
     actual_host = sockets[0].getsockname()[0]
     print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
+    def server_chunk(nonce, kind, index):
+        if kind == KIND_ARRIVALS:
+            return arrival_log.chunk(nonce, kind, index)
+        session = sessions.get(nonce)
+        return session.chunk(kind, index) if session else None
+
     try:
         while True:
-            for key, _mask in selector.select(1.0):
+            now = time.monotonic()
+            timeout = 1.0
+            for session in sessions.values():
+                wake = session.next_wakeup(now)
+                if wake is not None:
+                    timeout = min(timeout, wake)
+
+            for key, _mask in selector.select(timeout):
                 while True:
                     try:
                         data, addr = key.fileobj.recvfrom(UDP_MAX_PAYLOAD)
@@ -1503,16 +1715,41 @@ def run_udp_server(args):
                         break
                     if not data:
                         continue
-                    ctrl_reply = serve_ctrl_request(arrival_log, data)
-                    if ctrl_reply is not None:
-                        key.fileobj.sendto(ctrl_reply, addr)
+                    if ctrl_type(data) is not None:
+                        start = parse_ctrl_start(data)
+                        if start is not None:
+                            if start["nonce"] not in sessions:
+                                sessions[start["nonce"]] = ProbeSession(start, key.fileobj, addr)
+                                print(
+                                    f"[{time.strftime('%H:%M:%S')}] -R run for {addr[0]}: "
+                                    f"stream {start['stream']} count={start['count']} "
+                                    f"interval={start['interval']}s size={start['size']}",
+                                    flush=True,
+                                )
+                            key.fileobj.sendto(make_ctrl_ack(start["nonce"]), addr)
+                            continue
+                        ctrl_reply = serve_ctrl_request(server_chunk, data)
+                        if ctrl_reply is not None:
+                            key.fileobj.sendto(ctrl_reply, addr)
                         continue
                     meta = parse_payload(data)
                     if meta:
+                        session = sessions.get(meta["nonce"])
+                        if session is not None:
+                            # Echo of one of our own -R probes: verify, do not re-echo.
+                            session.on_echo(data, addr[0])
+                            progress.add(meta["nonce"], addr[0])
+                            continue
                         rseq = arrival_log.record(meta["nonce"], meta["seq"])
                         data = stamp_payload(data, rseq, time.monotonic_ns())
                         progress.add(meta["nonce"], addr[0])
                     key.fileobj.sendto(data, addr)
+
+            now = time.monotonic()
+            for nonce, session in list(sessions.items()):
+                session.pump(now)
+                if session.done and now - session.done_at > 3600:
+                    del sessions[nonce]
             progress.tick()
     except KeyboardInterrupt:
         print("\nstopped")
@@ -1522,6 +1759,259 @@ def run_udp_server(args):
             sock.close()
 
     return 0
+
+
+def run_udp_reverse_client(args, dest_ip):
+    """-R: connect as usual, then let the server probe us while we echo.
+
+    The report is still printed here. It combines the server's prober state
+    (pulled in-band after the run) with our own arrival log, so forward means
+    server -> client and reverse means client -> server.
+    """
+    streams, started = build_streams(args)
+    streams_by_nonce = {stream["nonce"]: stream for stream in streams}
+    selector = selectors.DefaultSelector()
+    socket_to_stream = {}
+    for stream in streams:
+        port = stream_port(args, stream)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((dest_ip, port))
+        except OSError as exc:
+            raise SystemExit(f"udp connect to {dest_ip}:{port} failed: {exc}") from exc
+        sock.setblocking(False)
+        stream["sock"] = sock
+        stream["port"] = port
+        socket_to_stream[sock.fileno()] = stream
+        selector.register(sock, selectors.EVENT_READ)
+
+    endpoint = endpoint_label(args, dest_ip)
+    print(
+        f"verify_ping udp -R {endpoint}: server probes {args.count} packets/stream, "
+        f"{args.parallel} streams, {args.count * args.parallel} total packets, {args.size} data bytes, "
+        f"interval {args.interval}s, ids {ident_range(streams)}; this client echoes"
+    )
+
+    arrival_log = ArrivalLog()
+    progress = ServerProgress(args.progress > 0)
+    acked = set()
+    summaries = {}
+    handshake_deadline = started + max(10.0, args.timeout * 3)
+    next_start_send = 0.0
+    expected_end = None
+    next_poll = None
+
+    def send_request(carrier, data):
+        carrier["sock"].send(data)
+
+    def recv_replies(wait):
+        replies = []
+        end = time.monotonic() + wait
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            events = selector.select(remaining)
+            if not events:
+                break
+            for key, _mask in events:
+                while True:
+                    try:
+                        data = key.fileobj.recv(UDP_MAX_PAYLOAD)
+                    except OSError:
+                        break
+                    if ctrl_type(data) == CTRL_CHUNK_REP:
+                        replies.append(data)
+        return replies
+
+    while True:
+        now = time.monotonic()
+
+        if len(acked) < len(streams) and now < handshake_deadline and now >= next_start_send:
+            for stream in streams:
+                if stream["nonce"] in acked:
+                    continue
+                try:
+                    stream["sock"].send(
+                        make_ctrl_start(
+                            stream["nonce"],
+                            stream["ident"],
+                            stream["stream"],
+                            args.count,
+                            int(args.interval * 1e6),
+                            args.size,
+                            int(args.timeout * 1e3),
+                        )
+                    )
+                except OSError:
+                    pass
+            next_start_send = now + 0.5
+
+        if expected_end is None and (len(acked) == len(streams) or now >= handshake_deadline):
+            if not acked:
+                raise SystemExit(
+                    "server never acknowledged the -R start on any stream "
+                    "(old server without -R support, or ports blocked toward it)"
+                )
+            expected_end = now + args.count * args.interval + args.timeout
+            next_poll = expected_end
+            print(
+                f"server acknowledged {len(acked)}/{len(streams)} streams; "
+                f"probing should take ~{expected_end - now:.0f}s"
+            )
+
+        acked_streams = [stream for stream in streams if stream["nonce"] in acked]
+        if expected_end is not None:
+            if all(summaries.get(stream["stream"], {}).get("done") for stream in acked_streams):
+                break
+            if now > expected_end + max(30.0, args.timeout * 3):
+                print("timed out waiting for the server to finish probing; reporting what we have")
+                break
+            if now >= next_poll:
+                for stream in acked_streams:
+                    if not summaries.get(stream["stream"], {}).get("done"):
+                        try:
+                            stream["sock"].send(make_ctrl_request(stream["nonce"], KIND_SUMMARY, 0))
+                        except OSError:
+                            pass
+                next_poll = now + 1.0
+
+        timeout = 0.5
+        if len(acked) < len(streams) and now < handshake_deadline:
+            timeout = min(timeout, max(0.0, next_start_send - now))
+        if next_poll is not None:
+            timeout = min(timeout, max(0.0, next_poll - now))
+
+        for key, _mask in selector.select(timeout):
+            stream = socket_to_stream[key.fileobj.fileno()]
+            while True:
+                try:
+                    data = key.fileobj.recv(UDP_MAX_PAYLOAD)
+                except OSError:
+                    break
+                kind = ctrl_type(data)
+                if kind == CTRL_START_ACK:
+                    nonce = parse_ctrl_ack(data)
+                    if nonce in streams_by_nonce:
+                        acked.add(nonce)
+                    continue
+                if kind == CTRL_CHUNK_REP:
+                    reply = parse_ctrl_reply(data)
+                    if reply and reply["kind"] == KIND_SUMMARY and reply["entries"]:
+                        owner = streams_by_nonce.get(reply["nonce"])
+                        if owner:
+                            summaries[owner["stream"]] = dict(
+                                zip(("sent", "verified", "bad", "duplicates", "unexpected", "done"),
+                                    reply["entries"][0])
+                            )
+                    continue
+                if kind is not None:
+                    continue
+                meta = parse_payload(data)
+                if meta and meta["nonce"] in streams_by_nonce:
+                    rseq = arrival_log.record(meta["nonce"], meta["seq"])
+                    try:
+                        stream["sock"].send(stamp_payload(data, rseq, time.monotonic_ns()))
+                    except OSError:
+                        pass
+                    progress.add(meta["nonce"], dest_ip)
+        progress.tick()
+
+    acked_streams = [stream for stream in streams if stream["nonce"] in acked]
+    reply_logs = None
+    if acked_streams:
+        reply_logs = fetch_logs(args, acked_streams, send_request, recv_replies, KIND_REPLIES)
+    for stream in streams:
+        stream["sock"].close()
+
+    return print_reverse_report(
+        args, dest_ip, started, streams, acked_streams, summaries, reply_logs, arrival_log
+    )
+
+
+def print_reverse_report(args, dest_ip, started, streams, acked_streams, summaries, reply_logs, arrival_log):
+    endpoint = endpoint_label(args, dest_ip)
+    elapsed = time.monotonic() - started
+    unacked = [stream for stream in streams if stream not in acked_streams]
+
+    report_streams = []
+    logs = {}
+    for stream in acked_streams:
+        summary = summaries.get(stream["stream"]) or {}
+        replies = (reply_logs or {}).get(stream["stream"])
+        report_streams.append(
+            {
+                "stream": stream["stream"],
+                "ident": stream["ident"],
+                "nonce": stream["nonce"],
+                "port": stream["port"],
+                "sent": summary.get("sent", 0),
+                "verified": summary.get("verified", 0),
+                "bad": summary.get("bad", 0),
+                "duplicates": summary.get("duplicates", 0),
+                "unexpected": summary.get("unexpected", 0),
+                "done": summary.get("done", 0),
+                "replies": replies or [],
+                "has_replies": replies is not None,
+            }
+        )
+        logs[stream["stream"]] = arrival_log.arrivals.get(stream["nonce"], []) if replies is not None else None
+
+    sent_total = sum(item["sent"] for item in report_streams)
+    verified_total = sum(item["verified"] for item in report_streams)
+    bad_total = sum(item["bad"] for item in report_streams)
+    lost_total = sent_total - verified_total - bad_total
+    duplicates = sum(item["duplicates"] for item in report_streams)
+    unexpected = sum(item["unexpected"] for item in report_streams)
+
+    print()
+    print(f"--- {endpoint} verified udp statistics (-R: server probes, client echoes) ---")
+    print(
+        f"streams={args.parallel} count_per_stream={args.count} sent={sent_total} "
+        f"verified={verified_total} lost={lost_total} bad_payload={bad_total} "
+        f"loss={loss_percent(sent_total, lost_total):.3f}% duplicates={duplicates} unexpected={unexpected}"
+    )
+    print(f"checked_payload={fmt_bytes(verified_total * args.size)} elapsed={elapsed:.3f}s")
+    if args.parallel > 1:
+        for item in report_streams:
+            lost = item["sent"] - item["verified"] - item["bad"]
+            print(
+                f"stream={item['stream']} sent={item['sent']} verified={item['verified']} "
+                f"lost={lost} loss={loss_percent(item['sent'], lost):.3f}% bad_payload={item['bad']}"
+            )
+    for stream in unacked:
+        print(
+            f"stream={stream['stream']} server never acknowledged the start on port {stream['port']}: "
+            f"client -> server path blocked (firewall / security group?) or old server"
+        )
+    for item in report_streams:
+        if not item["done"]:
+            print(f"stream={item['stream']} server did not report completion; figures may be partial")
+
+    missing = []
+    for item in report_streams:
+        if item["has_replies"]:
+            verified_seqs = {seq for seq, _rseq in item["replies"]}
+            missing.extend((item["stream"], seq) for seq in range(1, item["sent"] + 1) if seq not in verified_seqs)
+    if missing:
+        missing.sort()
+        if args.parallel == 1:
+            shown = ", ".join(str(seq) for _stream, seq in missing[:20])
+        else:
+            shown = ", ".join(f"{stream}:{seq}" for stream, seq in missing[:20])
+        print(f"missing request indexes: {shown}{' ...' if len(missing) > 20 else ''}")
+
+    if not args.no_directional and report_streams:
+        print()
+        print("note: -R swaps the roles, so below forward = server -> client and reverse = client -> server")
+        print_directional_stats(report_streams, logs, far="client")
+
+    ok = (
+        not unacked
+        and report_streams
+        and all(item["done"] and item["sent"] == item["verified"] and item["bad"] == 0 for item in report_streams)
+    )
+    return 0 if ok else 1
 
 
 def run_tcp_stream_server(args):
@@ -1613,6 +2103,8 @@ def main():
     if args.protocol == "icmp":
         return run_icmp_client(args, dest_ip)
     if args.protocol == "udp":
+        if args.reverse:
+            return run_udp_reverse_client(args, dest_ip)
         return run_udp_client(args, dest_ip)
     if args.protocol == "tcp":
         return run_raw_tcp_client(args, dest_ip)
