@@ -152,6 +152,51 @@ class ArrivalLog:
         return total_chunks, total, log[start:start + CTRL_CHUNK_SEQS]
 
 
+class ServerProgress:
+    """Once-a-second receive summary on the server so the far end shows life.
+
+    Prints only while packets are arriving, plus one line when a burst ends,
+    so an idle server does not spam its log.
+    """
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.next_tick = time.monotonic() + 1.0
+        self.window = 0
+        self.total = 0
+        self.streams = set()
+        self.clients = set()
+        self.active = False
+
+    def add(self, nonce, client_ip):
+        self.window += 1
+        self.total += 1
+        self.streams.add(nonce)
+        self.clients.add(client_ip)
+
+    def tick(self):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now < self.next_tick:
+            return
+        self.next_tick = now + 1.0
+        stamp = time.strftime("%H:%M:%S")
+        if self.window:
+            self.active = True
+            print(
+                f"[{stamp}] rx={self.window} pkt/s streams={len(self.streams)} "
+                f"clients={len(self.clients)} total={self.total}",
+                flush=True,
+            )
+        elif self.active:
+            self.active = False
+            print(f"[{stamp}] idle, total received {self.total}", flush=True)
+            self.streams.clear()
+            self.clients.clear()
+        self.window = 0
+
+
 def make_ctrl_request(nonce, index):
     return CTRL_MAGIC + struct.pack(CTRL_REQ_FMT, nonce, index)
 
@@ -520,7 +565,12 @@ def parse_args():
         help="parallel measurement streams to run",
     )
     parser.add_argument("-W", "--timeout", type=float, default=3.0, help="seconds to wait after last send")
-    parser.add_argument("--progress", type=int, default=100, help="print progress every N verified replies")
+    parser.add_argument(
+        "--progress",
+        type=int,
+        default=100,
+        help="client: print progress every N verified replies; server: per-second rx line (0 disables)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
     parser.add_argument(
         "--no-directional",
@@ -1333,12 +1383,14 @@ def run_raw_tcp_server(args):
     first_port = args.port
     last_port = args.port + args.parallel - 1
     arrival_log = ArrivalLog()
+    progress = ServerProgress(args.progress > 0)
     print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
     try:
         while True:
+            progress.tick()
             try:
                 packet, _addr = recv_sock.recvfrom(65535)
             except BlockingIOError:
@@ -1362,6 +1414,7 @@ def run_raw_tcp_server(args):
                     continue
                 rseq = arrival_log.record(payload_meta["nonce"], payload_meta["seq"])
                 echo_payload = stamp_payload(parsed["payload"], rseq, time.monotonic_ns())
+                progress.add(payload_meta["nonce"], parsed["src_ip"])
             ack = (parsed["seq"] + len(parsed["payload"])) & 0xFFFFFFFF
             reply = make_raw_tcp_packet(
                 parsed["dest_ip"],
@@ -1401,6 +1454,7 @@ def run_udp_server(args):
         sockets.append(sock)
 
     arrival_log = ArrivalLog()
+    progress = ServerProgress(args.progress > 0)
     actual_host = sockets[0].getsockname()[0]
     print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
@@ -1423,7 +1477,9 @@ def run_udp_server(args):
                     if meta:
                         rseq = arrival_log.record(meta["nonce"], meta["seq"])
                         data = stamp_payload(data, rseq, time.monotonic_ns())
+                        progress.add(meta["nonce"], addr[0])
                     key.fileobj.sendto(data, addr)
+            progress.tick()
     except KeyboardInterrupt:
         print("\nstopped")
     finally:

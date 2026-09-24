@@ -118,6 +118,19 @@ The older application-level TCP stream echo mode is still available as
 TCP stream mode uses a normal TCP connection and frames each payload internally
 before echoing it.
 
+While a UDP or raw TCP server is receiving test traffic it prints one line per
+second, and one more when the burst ends, so the far end shows whether packets
+arrive at all (handy when debugging a firewall):
+
+```text
+[14:02:11] rx=50 pkt/s streams=4 clients=1 total=50
+[14:02:12] rx=50 pkt/s streams=4 clients=1 total=100
+[14:02:13] idle, total received 100
+```
+
+Pass `--progress 0` to the server to silence it. On the client `--progress N`
+prints a line every N verified replies (default 100).
+
 Print every verified reply:
 
 ```sh
