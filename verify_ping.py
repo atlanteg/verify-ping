@@ -748,7 +748,8 @@ def parse_args():
         "--server",
         "--listen",
         action="store_true",
-        help="run UDP/TCP echo server instead of a client",
+        help="run UDP/TCP echo server instead of a client; --protocol may list several "
+        "(udp,tcp,tcp-stream or all) to serve them all from one process on the same ports",
     )
     parser.add_argument(
         "--bind",
@@ -814,13 +815,18 @@ def parse_args():
 
 def validate_args(args):
     protocols = [item.strip() for item in args.protocol.split(",") if item.strip()]
+    if protocols == ["all"]:
+        protocols = ["udp", "tcp", "tcp-stream"] if args.server else ["udp", "tcp", "icmp"]
     if not protocols:
         raise SystemExit("protocol is required")
     for item in protocols:
         if item not in PROTOCOLS:
-            raise SystemExit(f"unknown protocol {item!r}; choose from {', '.join(PROTOCOLS)}")
-    if len(protocols) > 1 and not args.hunt:
-        raise SystemExit("several protocols at once are only allowed with --hunt")
+            raise SystemExit(f"unknown protocol {item!r}; choose from {', '.join(PROTOCOLS)}, all")
+    if args.server and len(protocols) > 1 and "icmp" in protocols:
+        print("icmp: echo replies are answered by the kernel, nothing to run; serving the rest")
+        protocols = [item for item in protocols if item != "icmp"]
+    if len(protocols) > 1 and not (args.hunt or args.server):
+        raise SystemExit("several protocols at once are only allowed with --hunt or --server")
     args.protocols = protocols
     args.protocol = protocols[0]
     if args.hunt:
@@ -2356,11 +2362,9 @@ def main():
     validate_args(args)
 
     if args.server:
-        if args.protocol == "udp":
-            return run_udp_server(args)
-        if args.protocol == "tcp":
-            return run_raw_tcp_server(args)
-        return run_tcp_stream_server(args)
+        if len(args.protocols) > 1:
+            return run_multi_server(args)
+        return run_server(args)
 
     dest_ip = socket.gethostbyname(args.host)
     if not args.hunt:
@@ -2372,6 +2376,61 @@ def main():
         codes.append(run_client(args, dest_ip))
     print_hunt_summary(dest_ip)
     return max(codes)
+
+
+def run_server(args):
+    if args.protocol == "udp":
+        return run_udp_server(args)
+    if args.protocol == "tcp":
+        return run_raw_tcp_server(args)
+    return run_tcp_stream_server(args)
+
+
+def run_multi_server(args):
+    """Serve several protocols from one process, one server loop per thread.
+
+    UDP and TCP are separate port spaces, so the same --port range serves
+    both. A server that cannot start (raw TCP without root, port in use) is
+    reported and takes the whole process down with exit status 1 instead of
+    dying silently inside its thread.
+    """
+    import threading
+
+    failures = []
+    lock = threading.Lock()
+
+    def runner(protocol):
+        local = argparse.Namespace(**vars(args))
+        local.protocol = protocol
+        try:
+            run_server(local)
+        except SystemExit as exc:
+            with lock:
+                failures.append(f"{protocol} server: {exc}")
+        except Exception as exc:  # noqa: BLE001 - surface anything, the thread would vanish otherwise
+            with lock:
+                failures.append(f"{protocol} server crashed: {exc!r}")
+
+    threads = []
+    for protocol in args.protocols:
+        thread = threading.Thread(target=runner, args=(protocol,), daemon=True, name=protocol)
+        thread.start()
+        threads.append(thread)
+
+    try:
+        while True:
+            time.sleep(0.5)
+            with lock:
+                if failures:
+                    for item in failures:
+                        print(item, flush=True)
+                    print("stopping all servers", flush=True)
+                    return 1
+            if not any(thread.is_alive() for thread in threads):
+                return 0
+    except KeyboardInterrupt:
+        print("\nstopped")
+        return 0
 
 
 def run_client(args, dest_ip):

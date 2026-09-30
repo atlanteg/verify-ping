@@ -172,6 +172,19 @@ the server's `-P` range; ICMP varies the identifier), and ranks them:
 comma-separated `--protocol` list the protocols run one after another and a
 cross-protocol summary follows. Raw TCP and ICMP still need `sudo`.
 
+One server process can serve every protocol at once — UDP and TCP are
+separate port spaces, so the same `--port` range works for both:
+
+```sh
+sudo ./verify_ping.py --server --protocol all --port 50001 -P 8     # udp + raw tcp + tcp-stream
+sudo ./verify_ping.py --server --protocol udp,tcp --port 50001 -P 8
+```
+
+Each protocol runs in its own thread; if one cannot start (raw TCP without
+root, port already in use) the process reports it and exits with status 1.
+`icmp` in a server list is ignored with a note, since the kernel answers
+ICMP echo itself. On the client, `--protocol all` means `udp,tcp,icmp`.
+
 Each protocol prints a table sorted by minimum RTT:
 
 ```text
