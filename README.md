@@ -215,8 +215,13 @@ path within tolerance)` instead of a list. Progress lines are off under
 `--hunt` unless `--progress N` is given.
 
 - `rtt_min` is the propagation floor of that flow's path pair; `rtt_p50` the
-  typical value. Flows whose `rtt_min` differ by at most `--hunt-tolerance`
-  (default 0.15 ms) are grouped as one path (`A`, `B`, …).
+  typical value. Flows are grouped into paths (`A`, `B`, …) by gaps: a new
+  group starts only where sorted `rtt_min` values leave a gap wider than
+  `--hunt-tolerance` (default 0.15 ms). A "level" is a group with at least
+  two flows; single flows are reported as outliers, and a group whose values
+  spread continuously over more than twice the tolerance is flagged as
+  queueing rather than distinct paths — more probes per flow (`-c`) sharpen
+  the minima.
 - `fwd_rel` / `rev_rel` are the **relative one‑way delays**, each shown as
   the excess over the best flow in that direction. They come from the server
   receive stamp: `fwd = server_recv − client_send`, `rev = client_recv −
@@ -252,10 +257,12 @@ asymmetry (forward - reverse, by minima): -0.305 ms
 The bound is the sum of both error estimates. The estimate comes from the
 kernel's `esterror` when the daemon maintains it (ntpd, ptp4l), else from
 `chronyc tracking` (|offset| + root dispersion + root delay / 2), else from
-the kernel's max error while it stays sane; systemd-timesyncd provides none,
-so hosts running it show "synced, error estimate unavailable". If either
-side is not synced, has no estimate, or cannot be read, the absolute figures
-are withheld and
+the kernel's max error when it is under 10 ms; systemd-timesyncd provides
+none and lets the kernel max error drift into hundreds of milliseconds, so
+hosts running it show "synced, error estimate unavailable". The bound must
+also be at most half the round trip, otherwise the figures are withheld as
+"larger than the delays being measured". If either side is not synced, has
+no usable estimate, or cannot be read, the absolute figures are withheld and
 the reason is printed (`server clock NOT synced`, `clock sync status
 unknown on the client`, …); `--wallclock` prints them anyway, marked
 UNVERIFIED. A one-way delay that comes out negative beyond the claimed error

@@ -234,7 +234,7 @@ def clock_status():
                     if chrony_us:
                         status["esterror_us"] = chrony_us
                         status["source"] = CLOCK_CHRONY
-                    elif 0 < status["maxerror_us"] < 2_000_000:
+                    elif 0 < status["maxerror_us"] < 10_000:
                         status["esterror_us"] = status["maxerror_us"]
                         status["source"] = CLOCK_KERNEL_MAX
                 return status
@@ -1246,9 +1246,19 @@ def oneway_absolute(streams):
     return fwd, rev
 
 
-def clock_verdict(args, client, server):
-    """(bound_us or None, explanation) for printing absolute one-way delays."""
+def clock_verdict(args, client, server, rtt_ns=None):
+    """(bound_us or None, explanation) for printing absolute one-way delays.
+
+    Besides both clocks being synced, the combined error bound must be small
+    against the delays themselves (at most half the round trip), otherwise
+    'valid within ±900 ms' on a 30 ms path would be a number without meaning.
+    """
     bound = clock_bound_us(client, server)
+    if bound is not None and rtt_ns is not None and bound * 1000 > rtt_ns / 2:
+        return None, (
+            f"clock error bound ±{bound / 1000:.3f} ms is larger than the delays being measured "
+            f"(round trip {ms(rtt_ns)} ms)"
+        )
     if bound is not None:
         return bound, f"valid within ±{bound / 1000:.3f} ms"
     if server is None:
@@ -1279,7 +1289,8 @@ def print_oneway_stats(args, streams, server_clock):
     if not fwd or not rev:
         print("no server stamps; one-way delay n/a")
         return
-    bound, verdict = clock_verdict(args, client, server_clock)
+    rtts = [item[0] for stream in streams for item in stream["lat"]]
+    bound, verdict = clock_verdict(args, client, server_clock, min(rtts) if rtts else None)
     fmin, fp50, rmin, rp50 = min(fwd), percentile(fwd, 0.5), min(rev), percentile(rev, 0.5)
     if bound is None and not args.wallclock:
         print(f"absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
@@ -1427,14 +1438,31 @@ def hunt_flow_stats(stream, summary):
 
 
 def group_paths(rows, key, tolerance_ns):
-    """Greedy grouping: flows whose `key` is within tolerance of the group's best share a path."""
+    """Single-linkage grouping: a new group starts only where the sorted `key`
+    values leave a gap wider than the tolerance. Binning against the group's
+    best would slice a continuous spread into fake 'paths'."""
     groups = []
     for row in sorted((row for row in rows if row[key] is not None), key=lambda row: row[key]):
-        if groups and row[key] - groups[-1]["best"] <= tolerance_ns:
+        if groups and row[key] - groups[-1]["last"] <= tolerance_ns:
             groups[-1]["rows"].append(row)
+            groups[-1]["last"] = row[key]
         else:
-            groups.append({"best": row[key], "rows": [row]})
+            groups.append({"best": row[key], "last": row[key], "rows": [row]})
     return groups
+
+
+def levels_phrase(groups, tolerance_ns):
+    """'2 level(s)' plus notes on single-flow outliers and continuous spread."""
+    solid = [group for group in groups if len(group["rows"]) > 1]
+    singles = len(groups) - len(solid)
+    text = f"{len(solid)} level(s)"
+    if singles:
+        text += f" +{singles} single-flow outlier(s)"
+    wide = [group for group in solid if group["last"] - group["best"] > 2 * tolerance_ns]
+    if wide:
+        widest = max(group["last"] - group["best"] for group in wide)
+        text += f"; continuous spread up to {ms(widest)} ms inside a level (queueing rather than distinct paths; more -c sharpens minima)"
+    return text
 
 
 def flows_phrase(flows, total):
@@ -1537,12 +1565,14 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
         best["fwd_levels"], best["rev_levels"] = len(fwd_groups), len(rev_groups)
         best["fwd_spread"], best["rev_spread"] = fwd_spread, rev_spread
         total = len(answered)
+        best["fwd_levels_text"] = levels_phrase(fwd_groups, tolerance_ns)
+        best["rev_levels_text"] = levels_phrase(rev_groups, tolerance_ns)
         print(
-            f"forward (client -> server): {len(fwd_groups)} level(s), spread {ms(fwd_spread)} ms; "
+            f"forward (client -> server): {best['fwd_levels_text']}, spread {ms(fwd_spread)} ms; "
             f"fastest: {flows_phrase(fwd_flows, total)}"
         )
         print(
-            f"reverse (server -> client): {len(rev_groups)} level(s), spread {ms(rev_spread)} ms; "
+            f"reverse (server -> client): {best['rev_levels_text']}, spread {ms(rev_spread)} ms; "
             f"fastest: {flows_phrase(rev_flows, total)}"
         )
         if fwd_flows & rev_flows:
@@ -1554,7 +1584,7 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
             print("  no flow is fastest both ways (asymmetric ECMP)")
         print("  one-way figures above are relative to the best flow in each direction")
         client = clock_status()
-        bound, verdict = clock_verdict(args, client, server_clock)
+        bound, verdict = clock_verdict(args, client, server_clock, best_rtt_row["rtt_min"])
         print(f"  clocks: client {describe_clock(client)}; server "
               f"{describe_clock(server_clock) if server_clock else 'unknown (not reported)'}")
         abs_rows = [row for row in answered if row["fwd_abs_min"] is not None and row["rev_abs_min"] is not None]
@@ -1592,20 +1622,21 @@ def print_hunt_summary(dest_ip):
             continue
         top = result["groups"][0]
         row = top["rows"][0]
-        worst = result["groups"][-1]["best"]
+        worst = max(item["rtt_min"] for group in result["groups"] for item in group["rows"])
+        solid = sum(1 for group in result["groups"] if len(group["rows"]) > 1)
         print(
-            f"{protocol:<5} rtt {ms(row['rtt_min'])}..{ms(worst)} ms over {len(result['groups'])} path(s); "
+            f"{protocol:<5} rtt {ms(row['rtt_min'])}..{ms(worst)} ms, {solid} path level(s); "
             f"best flow {row['stream']} ({flow_label(protocol, row)})"
         )
         if "fwd" in result["best"]:
             fwd = result["best"]["fwd"]["rows"][0]
             rev = result["best"]["rev"]["rows"][0]
             print(
-                f"      forward: {result['best']['fwd_levels']} level(s), spread "
+                f"      forward: {result['best']['fwd_levels_text']}, spread "
                 f"{ms(result['best']['fwd_spread'])} ms, best flow {fwd['stream']} ({flow_label(protocol, fwd)})"
             )
             print(
-                f"      reverse: {result['best']['rev_levels']} level(s), spread "
+                f"      reverse: {result['best']['rev_levels_text']}, spread "
                 f"{ms(result['best']['rev_spread'])} ms, best flow {rev['stream']} ({flow_label(protocol, rev)})"
             )
         if overall is None or row["rtt_min"] < overall[1]:
