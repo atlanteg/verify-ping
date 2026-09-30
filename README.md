@@ -22,6 +22,8 @@ packets: forward (client → server) or reverse (server → client). See
 - Reports lost requests, bad payloads, duplicates, and unexpected replies
 - Per-direction loss, reordering, and duplication attribution (UDP, raw TCP)
 - Reverse mode (`-R`, like `iperf3 -R`): the server probes, the client echoes (UDP)
+- Path hunt (`--hunt`): many flows on different ports to land on different ECMP
+  paths, ranked by round trip and by relative one-way delay per direction
 - Live progress on both sides; no extra ports beyond the test ports
 - No third-party Python dependencies
 
@@ -150,6 +152,61 @@ reverse-lost seqs (echo never returned): 5, 17
 A stream whose start is never acknowledged (its port is blocked toward the
 server, or the server is too old) is reported as such and skipped. `-R` is
 currently UDP only.
+
+### Path hunt (`--hunt`)
+
+Backbones spread traffic over parallel links and paths by hashing the
+5‑tuple (addresses, protocol, ports). Two flows between the same hosts can
+therefore take different paths with different delay — and the path *back* is
+hashed independently of the path *there*. `--hunt FLOWS` runs many
+interleaved flows, each with its own source port (and destination port from
+the server's `-P` range; ICMP varies the identifier), and ranks them:
+
+```sh
+./verify_ping.py --server --protocol udp --port 50001 -P 8            # remote
+./verify_ping.py 10.200.200.1 --protocol udp,tcp,icmp --port 50001 -P 8 --hunt 32 -c 50 -i 0.05
+```
+
+`-P` is the number of server ports to spread over (must match the server),
+`--hunt` the number of flows; flows wrap around the port range. With a
+comma-separated `--protocol` list the protocols run one after another and a
+cross-protocol summary follows. Raw TCP and ICMP still need `sudo`.
+
+Each protocol prints a table sorted by minimum RTT:
+
+```text
+--- path hunt: udp, 8 flows x 50 probes ---
+flow path  src->dst         rtt_min   rtt_p50   fwd_rel   rev_rel     ok/sent    loss  lost f/r
+   3 A     41233->50003     197.412   197.630    +0.000    +0.312    50/50      0.00%       0/0
+   7 A     50981->50007     197.418   197.601    +0.004    +0.309    50/50      0.00%       0/0
+   1 B     62553->50001     198.905   199.120    +1.480    +0.000    49/50      2.00%       0/1
+   ...
+paths by rtt_min (tolerance 0.15 ms):
+  A: 197.412 ms  flows [3, 7, 4]
+  B: 198.905 ms  flows [1, 2, 8, 5, 6]
+best round trip: flow 3 (41233->50003) 197.412 ms, path A
+best forward (client -> server): flows [3, 4, 7]
+best reverse (server -> client): flows [1, 2, 5, 6, 8]
+  no flow is fastest both ways: forward paths spread 1.480 ms, reverse paths spread 0.312 ms (asymmetric ECMP)
+```
+
+- `rtt_min` is the propagation floor of that flow's path pair; `rtt_p50` the
+  typical value. Flows whose `rtt_min` differ by at most `--hunt-tolerance`
+  (default 0.15 ms) are grouped as one path (`A`, `B`, …).
+- `fwd_rel` / `rev_rel` are the **relative one‑way delays**, each shown as
+  the excess over the best flow in that direction. They come from the server
+  receive stamp: `fwd = server_recv − client_send`, `rev = client_recv −
+  server_recv`. Both contain the unknown clock offset between the hosts
+  (with opposite signs), and that offset is the same for every flow in a
+  run, so *differences between flows* are exact while absolute one‑way delay
+  is not measurable without synchronised clocks. Flows are sent interleaved,
+  so clock drift affects them all alike.
+- `lost f/r` is the per-flow loss split from the directional statistics.
+- ICMP has no server stamp, so it is ranked by round trip only.
+
+The final summary names the lowest round trip per protocol and overall, and
+the flows that were fastest forward and reverse — the 5‑tuples to pin a
+latency-sensitive connection to.
 
 ### TCP Stream
 

@@ -58,6 +58,10 @@ CTRL_WINDOW = 64            # outstanding chunk requests per round
 CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
 REVERSE_PROTOCOLS = ("udp",)
+PROTOCOLS = ("icmp", "udp", "tcp", "tcp-stream")
+HUNT_PROTOCOLS = ("icmp", "udp", "tcp")
+# Collected per-protocol path-hunt tables for the cross-protocol summary.
+HUNT_RESULTS = []
 IPV4_HEADER_SIZE = 20
 RAW_TCP_HEADER_SIZE = 20
 RAW_TCP_MAX_PAYLOAD = 65535 - IPV4_HEADER_SIZE - RAW_TCP_HEADER_SIZE
@@ -248,6 +252,7 @@ class ProbeSession:
             "next_send": now,
             "last_send": None,
             "replies": [],
+            "lat": [],
         }
         self.pending = {}
         self.completed = {}
@@ -735,9 +740,9 @@ def parse_args():
     parser.add_argument("host", nargs="?", help="destination host for client mode")
     parser.add_argument(
         "--protocol",
-        choices=("icmp", "udp", "tcp", "tcp-stream"),
         default="icmp",
-        help="transport to test",
+        help="transport to test: icmp, udp, tcp or tcp-stream; with --hunt a comma-separated "
+        "list runs them one after another (e.g. udp,tcp,icmp)",
     )
     parser.add_argument(
         "--server",
@@ -782,6 +787,22 @@ def parse_args():
         help="skip the post-run arrival log fetch; report round-trip stats only",
     )
     parser.add_argument(
+        "--hunt",
+        type=int,
+        default=0,
+        metavar="FLOWS",
+        help="path hunt: run FLOWS interleaved flows with different source/destination ports "
+        "(ICMP: identifiers) to land on different ECMP paths, then rank them by round-trip "
+        "and by relative one-way delay in each direction",
+    )
+    parser.add_argument(
+        "--hunt-tolerance",
+        type=float,
+        default=0.15,
+        metavar="MS",
+        help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
+    )
+    parser.add_argument(
         "-R",
         "--reverse",
         action="store_true",
@@ -792,6 +813,28 @@ def parse_args():
 
 
 def validate_args(args):
+    protocols = [item.strip() for item in args.protocol.split(",") if item.strip()]
+    if not protocols:
+        raise SystemExit("protocol is required")
+    for item in protocols:
+        if item not in PROTOCOLS:
+            raise SystemExit(f"unknown protocol {item!r}; choose from {', '.join(PROTOCOLS)}")
+    if len(protocols) > 1 and not args.hunt:
+        raise SystemExit("several protocols at once are only allowed with --hunt")
+    args.protocols = protocols
+    args.protocol = protocols[0]
+    if args.hunt:
+        if args.server:
+            raise SystemExit("--hunt is a client option")
+        if args.reverse:
+            raise SystemExit("--hunt cannot be combined with -R")
+        if args.hunt < 2 or args.hunt > 65535:
+            raise SystemExit("--hunt needs between 2 and 65535 flows")
+        if args.hunt_tolerance < 0:
+            raise SystemExit("--hunt-tolerance must be non-negative")
+        for item in protocols:
+            if item not in HUNT_PROTOCOLS:
+                raise SystemExit(f"--hunt supports {', '.join(HUNT_PROTOCOLS)}; not {item}")
     if args.server and args.protocol == "icmp":
         raise SystemExit("ICMP echo replies are provided by the OS; --server is only for UDP/TCP")
     if not args.server and not args.host:
@@ -821,7 +864,8 @@ def validate_args(args):
     if args.port is not None and not (1 <= args.port <= 65535):
         raise SystemExit("port must be between 1 and 65535")
 
-    if args.protocol in ("udp", "tcp", "tcp-stream") and args.port is None:
+    needs_port = any(item != "icmp" for item in args.protocols)
+    if needs_port and args.port is None:
         max_base_port = 65535 - args.parallel + 1
         min_base_port = 49152 if max_base_port >= 49152 else 1024
         if max_base_port < min_base_port:
@@ -830,12 +874,17 @@ def validate_args(args):
         label = "test" if args.server else "destination"
         print(f"no --port provided; picked random {label} base port {args.port}")
 
-    if args.protocol in ("udp", "tcp", "tcp-stream"):
+    if needs_port:
         last_port = args.port + args.parallel - 1
         if last_port > 65535:
             raise SystemExit(
                 f"port range {args.port}..{last_port} exceeds 65535; reduce --parallel or --port"
             )
+
+def stream_count(args):
+    """Number of client flows: --hunt flows spread over the -P server ports."""
+    return args.hunt or args.parallel
+
 
 def build_streams(args):
     base_ident = os.getpid() & 0xFFFF
@@ -843,7 +892,7 @@ def build_streams(args):
     streams = []
     used_idents = set()
 
-    for stream_no in range(1, args.parallel + 1):
+    for stream_no in range(1, stream_count(args) + 1):
         ident = (base_ident + stream_no - 1) & 0xFFFF
         if ident in used_idents:
             raise SystemExit("parallel produced duplicate identifiers")
@@ -865,6 +914,11 @@ def build_streams(args):
                 # Reply arrival order at the client, one entry per first-time
                 # verified reply: (seq, rseq). Used for reordering direction.
                 "replies": [],
+                # Per verified reply: (rtt_ns, fwd_rel_ns, rev_rel_ns). The
+                # one-way values carry the unknown clock offset between the two
+                # hosts, so only differences between flows are meaningful.
+                "lat": [],
+                "src_port": None,
             }
         )
 
@@ -880,7 +934,9 @@ def ident_range(streams):
 
 
 def stream_port(args, stream):
-    return args.port + stream["stream"] - 1
+    # Flows beyond the -P port range wrap around, so --hunt spreads many
+    # flows over the ports the server actually listens on.
+    return args.port + (stream["stream"] - 1) % args.parallel
 
 
 def port_range(args):
@@ -898,12 +954,13 @@ def endpoint_label(args, host):
 
 
 def print_client_header(args, dest_ip, streams):
-    target_total = args.count * args.parallel
+    target_total = args.count * stream_count(args)
     endpoint = endpoint_label(args, dest_ip)
     print(
         f"verify_ping {args.protocol} {endpoint}: {args.count} packets/stream, "
-        f"{args.parallel} streams, {target_total} total packets, {args.size} data bytes, "
+        f"{stream_count(args)} streams, {target_total} total packets, {args.size} data bytes, "
         f"interval {args.interval}s, ids {ident_range(streams)}"
+        + (f", path hunt over {args.parallel} server port(s)" if args.hunt else "")
     )
 
 
@@ -920,13 +977,13 @@ def print_client_stats(
     print()
     print(f"--- {endpoint} verified {args.protocol} statistics ---")
     print(
-        f"streams={args.parallel} count_per_stream={args.count} sent={sent_total} "
+        f"streams={stream_count(args)} count_per_stream={args.count} sent={sent_total} "
         f"verified={verified_total} lost={lost} bad_payload={len(bad)} "
         f"loss={loss_percent(sent_total, lost):.3f}% duplicates={duplicates} unexpected={unexpected}"
     )
     print(f"checked_payload={fmt_bytes(checked_bytes)} elapsed={elapsed:.3f}s")
 
-    if args.parallel > 1:
+    if stream_count(args) > 1 and not args.hunt:
         pending_by_stream = {stream["stream"]: 0 for stream in streams}
         for rec in pending.values():
             pending_by_stream[rec["stream"]] += 1
@@ -939,9 +996,9 @@ def print_client_stats(
                 f"bad_payload={stream['bad']}"
             )
 
-    if pending:
+    if pending and not args.hunt:
         missed_items = sorted((rec["stream"], rec["index"]) for rec in pending.values())
-        if args.parallel == 1:
+        if stream_count(args) == 1:
             missed = ", ".join(str(index) for _stream, index in missed_items[:20])
         else:
             missed = ", ".join(f"{stream}:{index}" for stream, index in missed_items[:20])
@@ -960,11 +1017,14 @@ def print_client_stats(
 
     if args.protocol in CONTROL_PROTOCOLS and not args.no_directional:
         if arrival_logs is not None:
-            print_directional_stats(streams, arrival_logs)
+            print_directional_stats(streams, arrival_logs, per_stream=not args.hunt)
     elif args.protocol == "icmp":
         print("directional stats: n/a for icmp (echo comes from the remote OS, no arrival log)")
     elif args.protocol == "tcp-stream":
         print("directional stats: n/a for tcp-stream (TCP masks loss and reordering)")
+
+    if args.hunt:
+        print_hunt_report(args, streams, arrival_logs)
 
     return 0 if sent_total == verified_total and not pending and not bad else 1
 
@@ -1006,7 +1066,7 @@ def fmt_seq_list(seqs, limit=20):
     return shown + (" ..." if len(seqs) > limit else "")
 
 
-def print_directional_stats(streams, logs, far="server"):
+def print_directional_stats(streams, logs, far="server", per_stream=True):
     """far names the echo side: 'server' normally, 'client' under -R."""
     unavailable = [stream for stream in streams if logs.get(stream["stream"]) is None]
     summaries = [
@@ -1048,6 +1108,8 @@ def print_directional_stats(streams, logs, far="server"):
     multi = len(streams) > 1
     if len(summaries) > 1:
         print_block("all streams: ", totals, totals["forward_lost"], totals["reverse_lost"])
+    if not per_stream:
+        return
     for stream, summary in summaries:
         label = f"stream={stream['stream']} " if multi else ""
         print_block(label, summary, len(summary["forward_lost"]), len(summary["reverse_lost"]))
@@ -1060,6 +1122,184 @@ def print_directional_stats(streams, logs, far="server"):
             print(f"{label}forward-lost seqs (never reached {far}): {fmt_seq_list(summary['forward_lost'])}")
         if summary["reverse_lost"]:
             print(f"{label}reverse-lost seqs (echo never returned): {fmt_seq_list(summary['reverse_lost'])}")
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))]
+
+
+def hunt_flow_stats(stream, summary):
+    """Per-flow latency and loss figures for the path-hunt table."""
+    lat = stream["lat"]
+    rtts = [item[0] for item in lat]
+    fwd = [item[1] for item in lat if item[1] is not None]
+    rev = [item[2] for item in lat if item[2] is not None]
+    lost = stream["sent"] - stream["verified"] - stream["bad"]
+    return {
+        "stream": stream["stream"],
+        "ident": stream["ident"],
+        "src_port": stream.get("src_port"),
+        "port": stream.get("port"),
+        "sent": stream["sent"],
+        "verified": stream["verified"],
+        "lost": lost,
+        "rtt_min": min(rtts) if rtts else None,
+        "rtt_p50": percentile(rtts, 0.5) if rtts else None,
+        "fwd_min": min(fwd) if fwd else None,
+        "rev_min": min(rev) if rev else None,
+        "fwd_lost": len(summary["forward_lost"]) if summary else None,
+        "rev_lost": len(summary["reverse_lost"]) if summary else None,
+    }
+
+
+def group_paths(rows, key, tolerance_ns):
+    """Greedy grouping: flows whose `key` is within tolerance of the group's best share a path."""
+    groups = []
+    for row in sorted((row for row in rows if row[key] is not None), key=lambda row: row[key]):
+        if groups and row[key] - groups[-1]["best"] <= tolerance_ns:
+            groups[-1]["rows"].append(row)
+        else:
+            groups.append({"best": row[key], "rows": [row]})
+    return groups
+
+
+def flow_label(protocol, row):
+    if protocol == "icmp":
+        return f"id 0x{row['ident']:04x}"
+    return f"{row['src_port']}->{row['port']}"
+
+
+def ms(value_ns):
+    return f"{value_ns / 1e6:.3f}"
+
+
+def print_hunt_report(args, streams, arrival_logs):
+    tolerance_ns = int(args.hunt_tolerance * 1e6)
+    rows = []
+    for stream in streams:
+        summary = None
+        if arrival_logs and arrival_logs.get(stream["stream"]) is not None:
+            summary = directional_summary(stream, arrival_logs[stream["stream"]])
+        rows.append(hunt_flow_stats(stream, summary))
+
+    answered = [row for row in rows if row["rtt_min"] is not None]
+    print()
+    print(f"--- path hunt: {args.protocol}, {len(rows)} flows x {args.count} probes ---")
+    if not answered:
+        print("no flow got a single verified reply; nothing to rank")
+        HUNT_RESULTS.append({"protocol": args.protocol, "rows": rows, "groups": [], "best": {}})
+        return
+
+    groups = group_paths(answered, "rtt_min", tolerance_ns)
+    group_of = {}
+    for index, group in enumerate(groups):
+        letter = chr(ord("A") + index) if index < 26 else f"G{index}"
+        group["label"] = letter
+        for row in group["rows"]:
+            group_of[row["stream"]] = letter
+
+    have_oneway = any(row["fwd_min"] is not None for row in answered)
+    fwd_best = min(row["fwd_min"] for row in answered if row["fwd_min"] is not None) if have_oneway else None
+    rev_best = min(row["rev_min"] for row in answered if row["rev_min"] is not None) if have_oneway else None
+
+    header = f"{'flow':>4} {'path':<5} {'src->dst':<14} {'rtt_min':>9} {'rtt_p50':>9}"
+    if have_oneway:
+        header += f" {'fwd_rel':>9} {'rev_rel':>9}"
+    header += f" {'ok/sent':>11} {'loss':>7}"
+    if have_oneway:
+        header += f" {'lost f/r':>9}"
+    print(header)
+    for row in sorted(answered, key=lambda row: row["rtt_min"]):
+        line = (
+            f"{row['stream']:>4} {group_of[row['stream']]:<5} {flow_label(args.protocol, row):<14} "
+            f"{ms(row['rtt_min']):>9} {ms(row['rtt_p50']):>9}"
+        )
+        if have_oneway:
+            fwd = f"+{ms(row['fwd_min'] - fwd_best)}" if row["fwd_min"] is not None else "n/a"
+            rev = f"+{ms(row['rev_min'] - rev_best)}" if row["rev_min"] is not None else "n/a"
+            line += f" {fwd:>9} {rev:>9}"
+        line += f" {row['verified']:>5}/{row['sent']:<5} {loss_percent(row['sent'], row['lost']):>6.2f}%"
+        if have_oneway:
+            fr = f"{row['fwd_lost']}/{row['rev_lost']}" if row["fwd_lost"] is not None else "n/a"
+            line += f" {fr:>9}"
+        print(line)
+    silent = [row for row in rows if row["rtt_min"] is None]
+    if silent:
+        print(f"flows with no verified reply: {', '.join(str(row['stream']) for row in silent)}")
+
+    print(f"paths by rtt_min (tolerance {args.hunt_tolerance:.2f} ms):")
+    for group in groups:
+        flows = ", ".join(str(row["stream"]) for row in group["rows"])
+        print(f"  {group['label']}: {ms(group['best'])} ms  flows [{flows}]")
+
+    best = {"rtt": groups[0]}
+    best_rtt_row = groups[0]["rows"][0]
+    print(
+        f"best round trip: flow {best_rtt_row['stream']} ({flow_label(args.protocol, best_rtt_row)}) "
+        f"{ms(best_rtt_row['rtt_min'])} ms, path {groups[0]['label']}"
+    )
+    if have_oneway:
+        fwd_groups = group_paths(answered, "fwd_min", tolerance_ns)
+        rev_groups = group_paths(answered, "rev_min", tolerance_ns)
+        fwd_flows = {row["stream"] for row in fwd_groups[0]["rows"]}
+        rev_flows = {row["stream"] for row in rev_groups[0]["rows"]}
+        best["fwd"] = fwd_groups[0]
+        best["rev"] = rev_groups[0]
+        print(f"best forward (client -> server): flows {sorted(fwd_flows)}")
+        print(f"best reverse (server -> client): flows {sorted(rev_flows)}")
+        if fwd_flows & rev_flows:
+            print(
+                f"  flows {sorted(fwd_flows & rev_flows)} are fastest in both directions "
+                f"(best round trip = best path both ways)"
+            )
+        else:
+            fwd_spread = fwd_groups[-1]["best"] - fwd_groups[0]["best"]
+            rev_spread = rev_groups[-1]["best"] - rev_groups[0]["best"]
+            print(
+                f"  no flow is fastest both ways: forward paths spread {ms(fwd_spread)} ms, "
+                f"reverse paths spread {ms(rev_spread)} ms (asymmetric ECMP)"
+            )
+        print("  one-way figures are relative to the best flow; absolute one-way delay needs synced clocks")
+    else:
+        print("  one-way split n/a: no server stamps for this protocol (round trip only)")
+
+    HUNT_RESULTS.append({"protocol": args.protocol, "rows": rows, "groups": groups, "best": best})
+
+
+def print_hunt_summary(dest_ip):
+    if len(HUNT_RESULTS) < 2:
+        return
+    print()
+    print(f"=== path hunt summary for {dest_ip} ===")
+    overall = None
+    for result in HUNT_RESULTS:
+        protocol = result["protocol"]
+        if not result["groups"]:
+            print(f"{protocol:<5} no replies")
+            continue
+        top = result["groups"][0]
+        row = top["rows"][0]
+        line = (
+            f"{protocol:<5} best rtt {ms(row['rtt_min'])} ms via flow {row['stream']} "
+            f"({flow_label(protocol, row)}), {len(result['groups'])} distinct path(s) by rtt"
+        )
+        if "fwd" in result["best"]:
+            fwd = result["best"]["fwd"]["rows"][0]
+            rev = result["best"]["rev"]["rows"][0]
+            line += (
+                f"; best forward flow {fwd['stream']} ({flow_label(protocol, fwd)}), "
+                f"best reverse flow {rev['stream']} ({flow_label(protocol, rev)})"
+            )
+        print(line)
+        if overall is None or row["rtt_min"] < overall[1]:
+            overall = (protocol, row["rtt_min"], row)
+    if overall:
+        protocol, rtt_min, row = overall
+        print(
+            f"lowest round trip overall: {ms(rtt_min)} ms with {protocol} "
+            f"flow {row['stream']} ({flow_label(protocol, row)})"
+        )
 
 
 def make_stream_payload(args, stream):
@@ -1125,9 +1365,21 @@ def verify_payload(payload, source, streams_by_ident, pending, completed, bad):
         del pending[key]
         return "bad"
 
+    now_ns = time.monotonic_ns()
     rtt_ms = (time.monotonic() - rec["sent_at"]) * 1000.0
     stream["verified"] += 1
     stream["replies"].append((parsed["seq"], parsed["rseq"]))
+    # Relative one-way delays: server receive stamp minus our send stamp, and
+    # our receive minus the server stamp. Each includes the unknown clock
+    # offset (once with each sign), so compare flows, never read them alone.
+    recv_ns = parsed["recv_ns"]
+    stream["lat"].append(
+        (
+            now_ns - parsed["send_ns"],
+            recv_ns - parsed["send_ns"] if recv_ns else None,
+            now_ns - recv_ns if recv_ns else None,
+        )
+    )
     completed[key] = digest
     del pending[key]
     return "ok", rec, rtt_ms
@@ -1151,7 +1403,7 @@ def should_stop_waiting(args, streams, pending, target_total):
 def run_icmp_client(args, dest_ip):
     streams, started = build_streams(args)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
-    target_total = args.count * args.parallel
+    target_total = args.count * stream_count(args)
     pending = {}
     completed = {}
     bad = []
@@ -1222,7 +1474,7 @@ def run_icmp_client(args, dest_ip):
 def run_udp_client(args, dest_ip):
     streams, started = build_streams(args)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
-    target_total = args.count * args.parallel
+    target_total = args.count * stream_count(args)
     pending = {}
     completed = {}
     bad = []
@@ -1242,6 +1494,7 @@ def run_udp_client(args, dest_ip):
         sock.setblocking(False)
         stream["sock"] = sock
         stream["port"] = port
+        stream["src_port"] = sock.getsockname()[1]
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
 
@@ -1343,7 +1596,7 @@ def run_udp_client(args, dest_ip):
 def run_tcp_stream_client(args, dest_ip):
     streams, started = build_streams(args)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
-    target_total = args.count * args.parallel
+    target_total = args.count * stream_count(args)
     pending = {}
     completed = {}
     bad = []
@@ -1362,6 +1615,7 @@ def run_tcp_stream_client(args, dest_ip):
         sock.setblocking(False)
         stream["sock"] = sock
         stream["port"] = port
+        stream["src_port"] = sock.getsockname()[1]
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
 
@@ -1450,7 +1704,13 @@ def run_tcp_stream_client(args, dest_ip):
     return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
 
 
-def assign_raw_tcp_source_ports(streams):
+def assign_raw_tcp_source_ports(streams, scatter=False):
+    if scatter:
+        # Path hunt: independent random source ports so the 5-tuples differ
+        # in more than the low bits, which some ECMP hashes ignore.
+        for stream, port in zip(streams, random.sample(range(20000, 60000), len(streams))):
+            stream["src_port"] = port
+        return
     base_port = random.randint(20000, 60000)
     used_ports = set()
     for index, stream in enumerate(streams):
@@ -1465,13 +1725,13 @@ def assign_raw_tcp_source_ports(streams):
 
 def run_raw_tcp_client(args, dest_ip):
     streams, started = build_streams(args)
-    assign_raw_tcp_source_ports(streams)
+    assign_raw_tcp_source_ports(streams, scatter=bool(args.hunt))
     for stream in streams:
         stream["port"] = stream_port(args, stream)
     streams_by_ident = {stream["ident"]: stream for stream in streams}
     source_ports = {stream["src_port"] for stream in streams}
     source_ip = route_source_ip(dest_ip)
-    target_total = args.count * args.parallel
+    target_total = args.count * stream_count(args)
     pending = {}
     completed = {}
     bad = []
@@ -1782,6 +2042,7 @@ def run_udp_reverse_client(args, dest_ip):
         sock.setblocking(False)
         stream["sock"] = sock
         stream["port"] = port
+        stream["src_port"] = sock.getsockname()[1]
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
 
@@ -2102,6 +2363,18 @@ def main():
         return run_tcp_stream_server(args)
 
     dest_ip = socket.gethostbyname(args.host)
+    if not args.hunt:
+        return run_client(args, dest_ip)
+
+    codes = []
+    for protocol in args.protocols:
+        args.protocol = protocol
+        codes.append(run_client(args, dest_ip))
+    print_hunt_summary(dest_ip)
+    return max(codes)
+
+
+def run_client(args, dest_ip):
     if args.protocol == "icmp":
         return run_icmp_client(args, dest_ip)
     if args.protocol == "udp":
