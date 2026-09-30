@@ -204,10 +204,15 @@ paths by rtt_min (tolerance 0.15 ms):
   A: 197.412 ms  flows [3, 7, 4]
   B: 198.905 ms  flows [1, 2, 8, 5, 6]
 best round trip: flow 3 (41233->50003) 197.412 ms, path A
-best forward (client -> server): flows [3, 4, 7]
-best reverse (server -> client): flows [1, 2, 5, 6, 8]
-  no flow is fastest both ways: forward paths spread 1.480 ms, reverse paths spread 0.312 ms (asymmetric ECMP)
+forward (client -> server): 2 level(s), spread 1.480 ms; fastest: flows [3, 4, 7]
+reverse (server -> client): 3 level(s), spread 0.312 ms; fastest: flows [1, 2, 5, 6, 8]
+  no flow is fastest both ways (asymmetric ECMP)
 ```
+
+When every flow lands on one path the table is folded to its top rows, and
+a direction where most flows tie is summarised as `26 of 32 flows (single
+path within tolerance)` instead of a list. Progress lines are off under
+`--hunt` unless `--progress N` is given.
 
 - `rtt_min` is the propagation floor of that flow's path pair; `rtt_p50` the
   typical value. Flows whose `rtt_min` differ by at most `--hunt-tolerance`
@@ -244,8 +249,13 @@ forward (client -> server): min 13.871 ms p50 14.020 ms | reverse (server -> cli
 asymmetry (forward - reverse, by minima): -0.305 ms
 ```
 
-The bound is the sum of both error estimates. If either side is not synced,
-has no estimate, or cannot be read, the absolute figures are withheld and
+The bound is the sum of both error estimates. The estimate comes from the
+kernel's `esterror` when the daemon maintains it (ntpd, ptp4l), else from
+`chronyc tracking` (|offset| + root dispersion + root delay / 2), else from
+the kernel's max error while it stays sane; systemd-timesyncd provides none,
+so hosts running it show "synced, error estimate unavailable". If either
+side is not synced, has no estimate, or cannot be read, the absolute figures
+are withheld and
 the reason is printed (`server clock NOT synced`, `clock sync status
 unknown on the client`, …); `--wallclock` prints them anyway, marked
 UNVERIFIED. A one-way delay that comes out negative beyond the claimed error

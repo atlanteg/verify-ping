@@ -63,8 +63,14 @@ KIND_ENTRY_FMT = {
     KIND_CLOCK: "!BQQB",
 }
 KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1, KIND_CLOCK: 1}
-CLOCK_UNKNOWN, CLOCK_KERNEL, CLOCK_TIMEDATECTL = 0, 1, 2
-CLOCK_SOURCE_NAMES = {CLOCK_UNKNOWN: "unknown", CLOCK_KERNEL: "kernel", CLOCK_TIMEDATECTL: "timedatectl"}
+CLOCK_UNKNOWN, CLOCK_KERNEL, CLOCK_TIMEDATECTL, CLOCK_CHRONY, CLOCK_KERNEL_MAX = 0, 1, 2, 3, 4
+CLOCK_SOURCE_NAMES = {
+    CLOCK_UNKNOWN: "unknown",
+    CLOCK_KERNEL: "kernel",
+    CLOCK_TIMEDATECTL: "timedatectl",
+    CLOCK_CHRONY: "chrony",
+    CLOCK_KERNEL_MAX: "kernel max error",
+}
 CTRL_WINDOW = 64            # outstanding chunk requests per round
 CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
@@ -213,12 +219,25 @@ def clock_status():
             state = libc.adjtimex(ctypes.byref(timex))
             if state >= 0:
                 unsync = bool(timex.status & 0x0040) or state == 5  # STA_UNSYNC / TIME_ERROR
-                return {
+                status = {
                     "synced": not unsync,
                     "esterror_us": max(0, int(timex.esterror)),
                     "maxerror_us": max(0, int(timex.maxerror)),
                     "source": CLOCK_KERNEL,
                 }
+                if status["synced"] and status["esterror_us"] == 0:
+                    # Not every daemon fills esterror (systemd-timesyncd does
+                    # not). Ask chrony directly, else fall back to the kernel's
+                    # max error when a daemon keeps it sane (it grows 500 ppm
+                    # between updates; 16 s means nobody maintains it).
+                    chrony_us = chrony_error_us()
+                    if chrony_us:
+                        status["esterror_us"] = chrony_us
+                        status["source"] = CLOCK_CHRONY
+                    elif 0 < status["maxerror_us"] < 2_000_000:
+                        status["esterror_us"] = status["maxerror_us"]
+                        status["source"] = CLOCK_KERNEL_MAX
+                return status
         except (OSError, AttributeError, ValueError):
             pass
         try:
@@ -233,6 +252,35 @@ def clock_status():
         except (OSError, subprocess.SubprocessError):
             pass
     return unknown
+
+
+def chrony_error_us():
+    """Clock error bound from `chronyc tracking`: |offset| + root dispersion + root delay / 2."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["chronyc", "tracking"], capture_output=True, text=True, timeout=2, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    values = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, _sep, rest = line.partition(":")
+        key = key.strip().lower()
+        try:
+            number = float(rest.strip().split()[0])
+        except (ValueError, IndexError):
+            continue
+        values[key] = number
+    if "leap status" in out.lower() and "not synchronised" in out.lower():
+        return 0
+    if "system time" not in values or "root dispersion" not in values:
+        return 0
+    seconds = abs(values["system time"]) + values["root dispersion"] + values.get("root delay", 0.0) / 2
+    return int(seconds * 1e6)
 
 
 def clock_record():
@@ -922,8 +970,9 @@ def parse_args():
     parser.add_argument(
         "--progress",
         type=int,
-        default=100,
-        help="client: print progress every N verified replies; server: per-second rx line (0 disables)",
+        default=None,
+        help="client: print progress every N verified replies (default 100, 0 under --hunt); "
+        "server: per-second rx line (0 disables)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
     parser.add_argument(
@@ -979,6 +1028,8 @@ def validate_args(args):
         raise SystemExit("several protocols at once are only allowed with --hunt or --server")
     args.protocols = protocols
     args.protocol = protocols[0]
+    if args.progress is None:
+        args.progress = 0 if (args.hunt and not args.server) else 100
     if args.hunt:
         if args.server:
             raise SystemExit("--hunt is a client option")
@@ -1211,7 +1262,10 @@ def clock_verdict(args, client, server):
         unsynced = [name for name, side in (("client", client), ("server", server)) if not side["synced"]]
         reason = f"{' and '.join(unsynced)} clock NOT synced"
     else:
-        reason = "no error estimate from the time daemon"
+        reason = (
+            "no error estimate from the time daemon (chrony and ntpd provide one, "
+            "systemd-timesyncd does not)"
+        )
     return None, reason
 
 
@@ -1383,6 +1437,13 @@ def group_paths(rows, key, tolerance_ns):
     return groups
 
 
+def flows_phrase(flows, total):
+    """'flows [3, 7]' when few, 'N of M flows (single path within tolerance)' when most."""
+    if len(flows) > 8 and len(flows) * 2 >= total:
+        return f"{len(flows)} of {total} flows (single path within tolerance)"
+    return f"flows {sorted(flows)}"
+
+
 def flow_label(protocol, row):
     if protocol == "icmp":
         return f"id 0x{row['ident']:04x}"
@@ -1429,7 +1490,11 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
     if have_oneway:
         header += f" {'lost f/r':>9}"
     print(header)
-    for row in sorted(answered, key=lambda row: row["rtt_min"]):
+    ordered = sorted(answered, key=lambda row: row["rtt_min"])
+    # One path for everybody: the full table says nothing the group line
+    # does not, so show the top few and fold the rest.
+    shown = ordered[:5] if len(groups) == 1 and len(ordered) > 8 else ordered
+    for row in shown:
         line = (
             f"{row['stream']:>4} {group_of[row['stream']]:<5} {flow_label(args.protocol, row):<14} "
             f"{ms(row['rtt_min']):>9} {ms(row['rtt_p50']):>9}"
@@ -1443,6 +1508,8 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
             fr = f"{row['fwd_lost']}/{row['rev_lost']}" if row["fwd_lost"] is not None else "n/a"
             line += f" {fr:>9}"
         print(line)
+    if len(shown) < len(ordered):
+        print(f"  ... {len(ordered) - len(shown)} more flows, all within tolerance of the same path")
     silent = [row for row in rows if row["rtt_min"] is None]
     if silent:
         print(f"flows with no verified reply: {', '.join(str(row['stream']) for row in silent)}")
@@ -1463,22 +1530,28 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
         rev_groups = group_paths(answered, "rev_min", tolerance_ns)
         fwd_flows = {row["stream"] for row in fwd_groups[0]["rows"]}
         rev_flows = {row["stream"] for row in rev_groups[0]["rows"]}
+        fwd_spread = fwd_groups[-1]["best"] - fwd_groups[0]["best"]
+        rev_spread = rev_groups[-1]["best"] - rev_groups[0]["best"]
         best["fwd"] = fwd_groups[0]
         best["rev"] = rev_groups[0]
-        print(f"best forward (client -> server): flows {sorted(fwd_flows)}")
-        print(f"best reverse (server -> client): flows {sorted(rev_flows)}")
+        best["fwd_levels"], best["rev_levels"] = len(fwd_groups), len(rev_groups)
+        best["fwd_spread"], best["rev_spread"] = fwd_spread, rev_spread
+        total = len(answered)
+        print(
+            f"forward (client -> server): {len(fwd_groups)} level(s), spread {ms(fwd_spread)} ms; "
+            f"fastest: {flows_phrase(fwd_flows, total)}"
+        )
+        print(
+            f"reverse (server -> client): {len(rev_groups)} level(s), spread {ms(rev_spread)} ms; "
+            f"fastest: {flows_phrase(rev_flows, total)}"
+        )
         if fwd_flows & rev_flows:
             print(
-                f"  flows {sorted(fwd_flows & rev_flows)} are fastest in both directions "
+                f"  {flows_phrase(fwd_flows & rev_flows, total)} fastest in both directions "
                 f"(best round trip = best path both ways)"
             )
         else:
-            fwd_spread = fwd_groups[-1]["best"] - fwd_groups[0]["best"]
-            rev_spread = rev_groups[-1]["best"] - rev_groups[0]["best"]
-            print(
-                f"  no flow is fastest both ways: forward paths spread {ms(fwd_spread)} ms, "
-                f"reverse paths spread {ms(rev_spread)} ms (asymmetric ECMP)"
-            )
+            print("  no flow is fastest both ways (asymmetric ECMP)")
         print("  one-way figures above are relative to the best flow in each direction")
         client = clock_status()
         bound, verdict = clock_verdict(args, client, server_clock)
@@ -1519,18 +1592,22 @@ def print_hunt_summary(dest_ip):
             continue
         top = result["groups"][0]
         row = top["rows"][0]
-        line = (
-            f"{protocol:<5} best rtt {ms(row['rtt_min'])} ms via flow {row['stream']} "
-            f"({flow_label(protocol, row)}), {len(result['groups'])} distinct path(s) by rtt"
+        worst = result["groups"][-1]["best"]
+        print(
+            f"{protocol:<5} rtt {ms(row['rtt_min'])}..{ms(worst)} ms over {len(result['groups'])} path(s); "
+            f"best flow {row['stream']} ({flow_label(protocol, row)})"
         )
         if "fwd" in result["best"]:
             fwd = result["best"]["fwd"]["rows"][0]
             rev = result["best"]["rev"]["rows"][0]
-            line += (
-                f"; best forward flow {fwd['stream']} ({flow_label(protocol, fwd)}), "
-                f"best reverse flow {rev['stream']} ({flow_label(protocol, rev)})"
+            print(
+                f"      forward: {result['best']['fwd_levels']} level(s), spread "
+                f"{ms(result['best']['fwd_spread'])} ms, best flow {fwd['stream']} ({flow_label(protocol, fwd)})"
             )
-        print(line)
+            print(
+                f"      reverse: {result['best']['rev_levels']} level(s), spread "
+                f"{ms(result['best']['rev_spread'])} ms, best flow {rev['stream']} ({flow_label(protocol, rev)})"
+            )
         if overall is None or row["rtt_min"] < overall[1]:
             overall = (protocol, row["rtt_min"], row)
     if overall:
@@ -1804,7 +1881,9 @@ def run_udp_client(args, dest_ip):
 
     arrival_logs = None
     server_clock = None
-    if not args.no_directional:
+    if not args.no_directional and not verified_total:
+        print("no verified reply on any stream; skipping the in-band fetch (nothing can come back either)")
+    elif not args.no_directional:
         # Pull the arrival log over the same connected sockets the test used.
         def send_request(stream, data):
             stream["sock"].send(data)
@@ -2070,7 +2149,13 @@ def run_raw_tcp_client(args, dest_ip):
             if should_stop_waiting(args, streams, pending, target_total):
                 break
 
-        if not args.no_directional:
+        if not args.no_directional and not verified_total:
+            print(
+                "no verified reply on any stream; skipping the in-band fetch (nothing can come back "
+                "either). Raw TCP needs the port open AND a NAT/firewall that passes segments "
+                "without a SYN; try --protocol tcp-stream to tell the two apart"
+            )
+        elif not args.no_directional:
             # Pull the arrival log as raw segments on the same ports the test used.
             def send_request(stream, data):
                 packet = make_raw_tcp_packet(
@@ -2624,6 +2709,9 @@ def main():
     codes = []
     for protocol in args.protocols:
         args.protocol = protocol
+        if len(args.protocols) > 1:
+            print()
+            print(f"===== {protocol} =====")
         codes.append(run_client(args, dest_ip))
     print_hunt_summary(dest_ip)
     return max(codes)
