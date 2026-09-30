@@ -1946,7 +1946,7 @@ def run_udp_server(args):
         try:
             sock.bind((args.bind, port))
         except OSError as exc:
-            raise SystemExit(f"udp bind to {args.bind}:{port} failed: {exc}") from exc
+            raise SystemExit(f"udp bind to {args.bind}:{port} failed: {exc}{bind_hint(port, exc)}") from exc
         sock.setblocking(False)
         selector.register(sock, selectors.EVENT_READ)
         sockets.append(sock)
@@ -2294,7 +2294,7 @@ def run_tcp_stream_server(args):
         try:
             server.bind((args.bind, port))
         except OSError as exc:
-            raise SystemExit(f"tcp bind to {args.bind}:{port} failed: {exc}") from exc
+            raise SystemExit(f"tcp bind to {args.bind}:{port} failed: {exc}{bind_hint(port, exc)}") from exc
         server.listen()
         server.setblocking(False)
         selector.register(server, selectors.EVENT_READ, {"listener": True})
@@ -2376,6 +2376,30 @@ def main():
         codes.append(run_client(args, dest_ip))
     print_hunt_summary(dest_ip)
     return max(codes)
+
+
+def ephemeral_port_range():
+    """Local ephemeral port range (Linux sysctl; sensible defaults elsewhere)."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as handle:
+            low, high = handle.read().split()
+            return int(low), int(high)
+    except (OSError, ValueError):
+        return (49152, 65535) if sys.platform == "darwin" else (32768, 60999)
+
+
+def bind_hint(port, exc):
+    """Explain EADDRINUSE on a port that an outgoing connection may be using."""
+    if getattr(exc, "errno", None) not in (48, 98):  # EADDRINUSE on macOS / Linux
+        return ""
+    low, high = ephemeral_port_range()
+    if not (low <= port <= high):
+        return ""
+    return (
+        f" (port {port} is inside the local ephemeral range {low}-{high}: an outgoing "
+        f"connection may be using it even though nothing listens there; check with "
+        f"'ss -tanp | grep :{port}' and pick a --port range outside {low}-{high}, e.g. {max(1024, low - 1000)})"
+    )
 
 
 def run_server(args):

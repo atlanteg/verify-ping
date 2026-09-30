@@ -182,6 +182,12 @@ sudo ./verify_ping.py --server --protocol udp,tcp --port 50001 -P 8
 
 Each protocol runs in its own thread; if one cannot start (raw TCP without
 root, port already in use) the process reports it and exits with status 1.
+
+Pick a `--port` range **outside the local ephemeral port range** (Linux:
+`cat /proc/sys/net/ipv4/ip_local_port_range`, usually 32768–60999). A port in
+that range may be taken by an *outgoing* connection at any moment; `bind()`
+then fails with "Address already in use" although `netstat -l` shows nothing.
+The server says so when it happens. Ports like `20100–20107` are safe.
 `icmp` in a server list is ignored with a note, since the kernel answers
 ICMP echo itself. On the client, `--protocol all` means `udp,tcp,icmp`.
 
