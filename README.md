@@ -227,6 +227,36 @@ The final summary names the lowest round trip per protocol and overall, and
 the flows that were fastest forward and reverse — the 5‑tuples to pin a
 latency-sensitive connection to.
 
+### Absolute one-way delay and clock sync
+
+Every packet also carries wall-clock stamps (client send, server receive),
+so absolute one-way delays *can* be computed — they are only meaningful when
+both clocks are disciplined. The tool checks that itself rather than trusting
+you: each side reads the kernel's view of its clock (`adjtimex(2)`: the
+`STA_UNSYNC` flag and the error estimate that chrony / ntpd / ptp4l
+maintain; `timedatectl` as a fallback), the server reports its status
+in-band, and the client prints both:
+
+```text
+--- one-way delay ---
+clocks: client synced, est. error ±0.412 ms (kernel); server synced, est. error ±0.087 ms (kernel)
+forward (client -> server): min 13.871 ms p50 14.020 ms | reverse (server -> client): min 14.176 ms p50 14.310 ms  (valid within ±0.499 ms)
+asymmetry (forward - reverse, by minima): -0.305 ms
+```
+
+The bound is the sum of both error estimates. If either side is not synced,
+has no estimate, or cannot be read, the absolute figures are withheld and
+the reason is printed (`server clock NOT synced`, `clock sync status
+unknown on the client`, …); `--wallclock` prints them anyway, marked
+UNVERIFIED. A one-way delay that comes out negative beyond the claimed error
+proves the clocks disagree more than they admit, and the tool says so.
+
+What counts as "synced enough": NTP over the internet typically gives
+1–10 ms, which is too coarse for sub-millisecond asymmetry; chrony against a
+nearby stratum-1 gives 0.1–1 ms; PTP or a GPS receiver gives microseconds.
+The relative per-flow comparison in `--hunt` never needs any of this. `-R`
+does not report one-way delay.
+
 ### TCP Stream
 
 The older application-level TCP stream echo mode is still available as
@@ -370,13 +400,14 @@ but they do require the `verify-ping` echo server to be running on the other
 side.
 
 The sequence number is 16-bit, so one run is limited to `65535` packets per
-stream. Payloads must be at least `54` bytes (client header + server stamp) so
+stream. Payloads must be at least `70` bytes (client header + server stamp) so
 each packet can carry the verification header.
 
 The wire format changed in 0.6.0 (`vpng3` magic, server stamp), the arrival
 log moved in-band in 0.7.0 (the 0.6 TCP control port and `--control-port` are
 gone), and the in-band control messages gained a type byte and log kinds in
-0.8.0 (`vpnc4`, for `-R`). Run the same version on both sides; against an
+0.8.0 (`vpnc4`, for `-R`); 0.10.0 added wall-clock stamps and the clock status
+exchange (`vpng4`). Run the same version on both sides; against an
 older server the client reports that the log fetch was incomplete (or, under
 `-R`, that the start was never acknowledged) and skips directional
 statistics.

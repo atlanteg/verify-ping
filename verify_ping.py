@@ -12,16 +12,19 @@ import time
 
 ICMP_ECHO_REPLY = 0
 ICMP_ECHO_REQUEST = 8
-MAGIC = b"vpng3\x00\x00\x00"
-# Client-owned header: ident, stream, seq, index, send_ns, run_nonce.
-PAYLOAD_HEADER = "!HHHIQ16s"
+MAGIC = b"vpng4\x00\x00\x00"
+# Client-owned header: ident, stream, seq, index, send_ns (monotonic),
+# send_wall_ns (wall clock), run_nonce.
+PAYLOAD_HEADER = "!HHHIQQ16s"
 CLIENT_HEADER_SIZE = len(MAGIC) + struct.calcsize(PAYLOAD_HEADER)
 # Server-owned stamp, written by the echo server into every reply:
-#   rseq   -- per-stream monotonic receive counter (server arrival order)
-#   recv_ns-- server receive timestamp (reserved for one-way delay use)
+#   rseq         -- per-stream receive counter (server arrival order)
+#   recv_ns      -- server monotonic receive time: relative one-way delays
+#   recv_wall_ns -- server wall-clock receive time: absolute one-way delays
+#                   when both clocks are synchronised
 # The client always sends this region zeroed; it is normalized back to zero
 # before payload verification, so SHA-256 still covers the whole packet.
-STAMP_FMT = "!IQ"
+STAMP_FMT = "!IQQ"
 STAMP_SIZE = struct.calcsize(STAMP_FMT)
 STAMP_OFFSET = CLIENT_HEADER_SIZE
 STAMP_END = STAMP_OFFSET + STAMP_SIZE
@@ -52,8 +55,16 @@ CTRL_ACK_SIZE = CTRL_BODY_OFFSET + struct.calcsize(CTRL_ACK_FMT)
 KIND_ARRIVALS = 0           # echo side: seqs in arrival order            (!H)
 KIND_REPLIES = 1            # probe side: (seq, rseq) in reply order      (!HI)
 KIND_SUMMARY = 2            # probe side: sent, verified, bad, dup, unexpected, done
-KIND_ENTRY_FMT = {KIND_ARRIVALS: "!H", KIND_REPLIES: "!HI", KIND_SUMMARY: "!HHHHHB"}
-KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1}
+KIND_CLOCK = 3              # either side: synced, esterror_us, maxerror_us, source
+KIND_ENTRY_FMT = {
+    KIND_ARRIVALS: "!H",
+    KIND_REPLIES: "!HI",
+    KIND_SUMMARY: "!HHHHHB",
+    KIND_CLOCK: "!BQQB",
+}
+KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1, KIND_CLOCK: 1}
+CLOCK_UNKNOWN, CLOCK_KERNEL, CLOCK_TIMEDATECTL = 0, 1, 2
+CLOCK_SOURCE_NAMES = {CLOCK_UNKNOWN: "unknown", CLOCK_KERNEL: "kernel", CLOCK_TIMEDATECTL: "timedatectl"}
 CTRL_WINDOW = 64            # outstanding chunk requests per round
 CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
@@ -93,12 +104,12 @@ def expand(seed, size):
     return bytes(out[:size])
 
 
-def make_payload(size, ident, stream, seq, index, send_ns, run_nonce):
+def make_payload(size, ident, stream, seq, index, send_ns, run_nonce, send_wall_ns=0):
     # Client header followed by a zeroed server stamp; the deterministic
     # filler is derived from the whole prefix so every packet is unique.
     prefix = (
         MAGIC
-        + struct.pack(PAYLOAD_HEADER, ident, stream, seq, index, send_ns, run_nonce)
+        + struct.pack(PAYLOAD_HEADER, ident, stream, seq, index, send_ns, send_wall_ns, run_nonce)
         + bytes(STAMP_SIZE)
     )
     if size <= len(prefix):
@@ -110,26 +121,39 @@ def parse_payload(payload):
     if len(payload) < PAYLOAD_HEADER_SIZE or not payload.startswith(MAGIC):
         return None
     start = len(MAGIC)
-    ident, stream, seq, index, send_ns, nonce = struct.unpack(
+    ident, stream, seq, index, send_ns, send_wall_ns, nonce = struct.unpack(
         PAYLOAD_HEADER, payload[start:CLIENT_HEADER_SIZE]
     )
-    rseq, recv_ns = struct.unpack_from(STAMP_FMT, payload, STAMP_OFFSET)
+    rseq, recv_ns, recv_wall_ns = struct.unpack_from(STAMP_FMT, payload, STAMP_OFFSET)
     return {
         "ident": ident,
         "stream": stream,
         "seq": seq,
         "index": index,
         "send_ns": send_ns,
+        "send_wall_ns": send_wall_ns,
         "nonce": nonce,
         "rseq": rseq,
         "recv_ns": recv_ns,
+        "recv_wall_ns": recv_wall_ns,
     }
 
 
-def stamp_payload(payload, rseq, recv_ns):
-    """Return a copy of payload with the server stamp filled in."""
+def stamp_payload(payload, rseq, recv_ns=None, recv_wall_ns=None):
+    """Return a copy of payload with the server stamp filled in (now by default)."""
+    if recv_ns is None:
+        recv_ns = time.monotonic_ns()
+    if recv_wall_ns is None:
+        recv_wall_ns = time.time_ns()
     buf = bytearray(payload)
-    struct.pack_into(STAMP_FMT, buf, STAMP_OFFSET, rseq & 0xFFFFFFFF, recv_ns & 0xFFFFFFFFFFFFFFFF)
+    struct.pack_into(
+        STAMP_FMT,
+        buf,
+        STAMP_OFFSET,
+        rseq & 0xFFFFFFFF,
+        recv_ns & 0xFFFFFFFFFFFFFFFF,
+        recv_wall_ns & 0xFFFFFFFFFFFFFFFF,
+    )
     return bytes(buf)
 
 
@@ -138,8 +162,113 @@ def normalize_payload(payload):
     if len(payload) < STAMP_END:
         return payload
     buf = bytearray(payload)
-    struct.pack_into(STAMP_FMT, buf, STAMP_OFFSET, 0, 0)
+    struct.pack_into(STAMP_FMT, buf, STAMP_OFFSET, 0, 0, 0)
     return bytes(buf)
+
+
+def clock_status():
+    """How well this host's wall clock is disciplined, as the kernel sees it.
+
+    Returns {"synced": True/False/None, "esterror_us", "maxerror_us", "source"}.
+    Linux: adjtimex(2) via ctypes -- STA_UNSYNC and the esterror/maxerror
+    fields that chrony/ntpd/ptp4l maintain. Fallback: timedatectl. Elsewhere
+    the status is unknown.
+    """
+    unknown = {"synced": None, "esterror_us": 0, "maxerror_us": 0, "source": CLOCK_UNKNOWN}
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            class Timeval(ctypes.Structure):
+                _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long)]
+
+            class Timex(ctypes.Structure):
+                _fields_ = [
+                    ("modes", ctypes.c_uint),
+                    ("offset", ctypes.c_long),
+                    ("freq", ctypes.c_long),
+                    ("maxerror", ctypes.c_long),
+                    ("esterror", ctypes.c_long),
+                    ("status", ctypes.c_int),
+                    ("constant", ctypes.c_long),
+                    ("precision", ctypes.c_long),
+                    ("tolerance", ctypes.c_long),
+                    ("time", Timeval),
+                    ("tick", ctypes.c_long),
+                    ("ppsfreq", ctypes.c_long),
+                    ("jitter", ctypes.c_long),
+                    ("shift", ctypes.c_int),
+                    ("stabil", ctypes.c_long),
+                    ("jitcnt", ctypes.c_long),
+                    ("calcnt", ctypes.c_long),
+                    ("errcnt", ctypes.c_long),
+                    ("stbcnt", ctypes.c_long),
+                    ("tai", ctypes.c_int),
+                    ("pad", ctypes.c_int * 11),
+                ]
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            timex = Timex()
+            timex.modes = 0
+            state = libc.adjtimex(ctypes.byref(timex))
+            if state >= 0:
+                unsync = bool(timex.status & 0x0040) or state == 5  # STA_UNSYNC / TIME_ERROR
+                return {
+                    "synced": not unsync,
+                    "esterror_us": max(0, int(timex.esterror)),
+                    "maxerror_us": max(0, int(timex.maxerror)),
+                    "source": CLOCK_KERNEL,
+                }
+        except (OSError, AttributeError, ValueError):
+            pass
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                capture_output=True, text=True, timeout=2, check=False,
+            ).stdout.strip().lower()
+            if out in ("yes", "no"):
+                return {"synced": out == "yes", "esterror_us": 0, "maxerror_us": 0, "source": CLOCK_TIMEDATECTL}
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return unknown
+
+
+def clock_record():
+    status = clock_status()
+    synced = {True: 1, False: 0, None: 2}[status["synced"]]
+    return (synced, status["esterror_us"], status["maxerror_us"], status["source"])
+
+
+def clock_from_record(record):
+    synced, esterror_us, maxerror_us, source = record
+    return {
+        "synced": {1: True, 0: False}.get(synced),
+        "esterror_us": esterror_us,
+        "maxerror_us": maxerror_us,
+        "source": source,
+    }
+
+
+def describe_clock(status):
+    source = CLOCK_SOURCE_NAMES.get(status["source"], "unknown")
+    if status["synced"] is None:
+        return "unknown (no kernel/NTP status available)"
+    if not status["synced"]:
+        return f"NOT synced ({source})"
+    if status["esterror_us"]:
+        return f"synced, est. error ±{status['esterror_us'] / 1000:.3f} ms ({source})"
+    return f"synced, error estimate unavailable ({source})"
+
+
+def clock_bound_us(client, server):
+    """Combined error bound in µs when both sides are synced and report one; else None."""
+    if not (client and server and client["synced"] and server["synced"]):
+        return None
+    if client["esterror_us"] == 0 or server["esterror_us"] == 0:
+        return None
+    return client["esterror_us"] + server["esterror_us"]
 
 
 def count_reordered(keys):
@@ -273,7 +402,8 @@ class ProbeSession:
         while not self.done and stream["sent"] < self.count and now >= stream["next_send"]:
             seq = stream["sent"] + 1
             payload = make_payload(
-                self.size, stream["ident"], stream["stream"], seq, seq, time.monotonic_ns(), self.nonce
+                self.size, stream["ident"], stream["stream"], seq, seq,
+                time.monotonic_ns(), self.nonce, time.time_ns(),
             )
             try:
                 self.sock.sendto(payload, self.addr)
@@ -432,6 +562,15 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
     return fetch_logs(args, streams, send_request, recv_replies, KIND_ARRIVALS)
 
 
+def fetch_server_clock(args, streams, send_request, recv_replies):
+    """The echo side's clock status, or None if it cannot be fetched."""
+    logs = fetch_logs(args, streams[:1], send_request, recv_replies, KIND_CLOCK, budget=3.0)
+    if not logs:
+        return None
+    entries = logs.get(streams[0]["stream"])
+    return clock_from_record(entries[0]) if entries else None
+
+
 def fetch_logs(args, streams, send_request, recv_replies, kind, budget=None):
     """Pull one kind of log for each stream over the data path.
 
@@ -457,7 +596,12 @@ def fetch_logs(args, streams, send_request, recv_replies, kind, budget=None):
     if budget is None:
         budget = max(10.0, args.timeout * 3)
     deadline = time.monotonic() + budget
-    label = {KIND_ARRIVALS: "arrival log", KIND_REPLIES: "reply log", KIND_SUMMARY: "summary"}[kind]
+    label = {
+        KIND_ARRIVALS: "arrival log",
+        KIND_REPLIES: "reply log",
+        KIND_SUMMARY: "summary",
+        KIND_CLOCK: "clock status",
+    }[kind]
 
     while time.monotonic() < deadline:
         wanted = []
@@ -804,6 +948,12 @@ def parse_args():
         help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
     )
     parser.add_argument(
+        "--wallclock",
+        action="store_true",
+        help="print absolute one-way delays even when a clock is not reported as synchronised "
+        "(the values then include the clock offset between the hosts)",
+    )
+    parser.add_argument(
         "-R",
         "--reverse",
         action="store_true",
@@ -971,7 +1121,8 @@ def print_client_header(args, dest_ip, streams):
 
 
 def print_client_stats(
-    args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs=None
+    args, dest_ip, started, streams, pending, bad, duplicates, unexpected,
+    arrival_logs=None, server_clock=None,
 ):
     sent_total = sum(stream["sent"] for stream in streams)
     verified_total = sum(stream["verified"] for stream in streams)
@@ -1030,9 +1181,67 @@ def print_client_stats(
         print("directional stats: n/a for tcp-stream (TCP masks loss and reordering)")
 
     if args.hunt:
-        print_hunt_report(args, streams, arrival_logs)
+        print_hunt_report(args, streams, arrival_logs, server_clock)
+    elif args.protocol in CONTROL_PROTOCOLS and not args.no_directional:
+        print_oneway_stats(args, streams, server_clock)
 
     return 0 if sent_total == verified_total and not pending and not bad else 1
+
+
+def oneway_absolute(streams):
+    """(fwd list, rev list) of absolute wall-clock one-way delays over all streams."""
+    fwd = [item[3] for stream in streams for item in stream["lat"] if item[3] is not None]
+    rev = [item[4] for stream in streams for item in stream["lat"] if item[4] is not None]
+    return fwd, rev
+
+
+def clock_verdict(args, client, server):
+    """(bound_us or None, explanation) for printing absolute one-way delays."""
+    bound = clock_bound_us(client, server)
+    if bound is not None:
+        return bound, f"valid within ±{bound / 1000:.3f} ms"
+    if server is None:
+        reason = "server clock status not available"
+    elif client["synced"] is None or (server["synced"] is None):
+        reason = "clock sync status unknown on " + (
+            "both sides" if client["synced"] is None and server["synced"] is None
+            else "the client" if client["synced"] is None else "the server"
+        )
+    elif not client["synced"] or not server["synced"]:
+        unsynced = [name for name, side in (("client", client), ("server", server)) if not side["synced"]]
+        reason = f"{' and '.join(unsynced)} clock NOT synced"
+    else:
+        reason = "no error estimate from the time daemon"
+    return None, reason
+
+
+def print_oneway_stats(args, streams, server_clock):
+    client = clock_status()
+    fwd, rev = oneway_absolute(streams)
+    print()
+    print("--- one-way delay ---")
+    print(f"clocks: client {describe_clock(client)}; server "
+          f"{describe_clock(server_clock) if server_clock else 'unknown (not reported)'}")
+    if not fwd or not rev:
+        print("no server stamps; one-way delay n/a")
+        return
+    bound, verdict = clock_verdict(args, client, server_clock)
+    fmin, fp50, rmin, rp50 = min(fwd), percentile(fwd, 0.5), min(rev), percentile(rev, 0.5)
+    if bound is None and not args.wallclock:
+        print(f"absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
+        return
+    tag = verdict if bound is not None else f"UNVERIFIED, {verdict}: values include the clock offset"
+    print(
+        f"forward (client -> server): min {ms(fmin)} ms p50 {ms(fp50)} ms | "
+        f"reverse (server -> client): min {ms(rmin)} ms p50 {ms(rp50)} ms  ({tag})"
+    )
+    print(f"asymmetry (forward - reverse, by minima): {ms(fmin - rmin)} ms")
+    if bound is not None and (fmin < -bound * 1000 or rmin < -bound * 1000):
+        off = max(-fmin, -rmin) / 1e6 - bound / 1000
+        print(
+            f"WARNING: a one-way delay is negative beyond the claimed clock error; the clocks "
+            f"disagree by at least {off:.3f} ms more than reported -- treat them as unsynced"
+        )
 
 
 def directional_summary(stream, server_log):
@@ -1141,6 +1350,8 @@ def hunt_flow_stats(stream, summary):
     rtts = [item[0] for item in lat]
     fwd = [item[1] for item in lat if item[1] is not None]
     rev = [item[2] for item in lat if item[2] is not None]
+    fwd_abs = [item[3] for item in lat if item[3] is not None]
+    rev_abs = [item[4] for item in lat if item[4] is not None]
     lost = stream["sent"] - stream["verified"] - stream["bad"]
     return {
         "stream": stream["stream"],
@@ -1154,6 +1365,8 @@ def hunt_flow_stats(stream, summary):
         "rtt_p50": percentile(rtts, 0.5) if rtts else None,
         "fwd_min": min(fwd) if fwd else None,
         "rev_min": min(rev) if rev else None,
+        "fwd_abs_min": min(fwd_abs) if fwd_abs else None,
+        "rev_abs_min": min(rev_abs) if rev_abs else None,
         "fwd_lost": len(summary["forward_lost"]) if summary else None,
         "rev_lost": len(summary["reverse_lost"]) if summary else None,
     }
@@ -1180,7 +1393,7 @@ def ms(value_ns):
     return f"{value_ns / 1e6:.3f}"
 
 
-def print_hunt_report(args, streams, arrival_logs):
+def print_hunt_report(args, streams, arrival_logs, server_clock=None):
     tolerance_ns = int(args.hunt_tolerance * 1e6)
     rows = []
     for stream in streams:
@@ -1266,7 +1479,27 @@ def print_hunt_report(args, streams, arrival_logs):
                 f"  no flow is fastest both ways: forward paths spread {ms(fwd_spread)} ms, "
                 f"reverse paths spread {ms(rev_spread)} ms (asymmetric ECMP)"
             )
-        print("  one-way figures are relative to the best flow; absolute one-way delay needs synced clocks")
+        print("  one-way figures above are relative to the best flow in each direction")
+        client = clock_status()
+        bound, verdict = clock_verdict(args, client, server_clock)
+        print(f"  clocks: client {describe_clock(client)}; server "
+              f"{describe_clock(server_clock) if server_clock else 'unknown (not reported)'}")
+        abs_rows = [row for row in answered if row["fwd_abs_min"] is not None and row["rev_abs_min"] is not None]
+        if abs_rows and (bound is not None or args.wallclock):
+            best_f = min(abs_rows, key=lambda row: row["fwd_abs_min"])
+            best_r = min(abs_rows, key=lambda row: row["rev_abs_min"])
+            tag = verdict if bound is not None else f"UNVERIFIED, {verdict}"
+            print(
+                f"  absolute one-way ({tag}): best forward {ms(best_f['fwd_abs_min'])} ms "
+                f"(flow {best_f['stream']}), best reverse {ms(best_r['rev_abs_min'])} ms "
+                f"(flow {best_r['stream']}), asymmetry {ms(best_f['fwd_abs_min'] - best_r['rev_abs_min'])} ms"
+            )
+            if bound is not None and (
+                best_f["fwd_abs_min"] < -bound * 1000 or best_r["rev_abs_min"] < -bound * 1000
+            ):
+                print("  WARNING: negative one-way delay beyond the claimed clock error; treat clocks as unsynced")
+        elif abs_rows:
+            print(f"  absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
     else:
         print("  one-way split n/a: no server stamps for this protocol (round trip only)")
 
@@ -1310,15 +1543,15 @@ def print_hunt_summary(dest_ip):
 
 def make_stream_payload(args, stream):
     seq = stream["sent"] + 1
-    send_ns = time.monotonic_ns()
     payload = make_payload(
         args.size,
         stream["ident"],
         stream["stream"],
         seq,
         seq,
-        send_ns,
+        time.monotonic_ns(),
         stream["nonce"],
+        time.time_ns(),
     )
     return seq, payload
 
@@ -1372,18 +1605,24 @@ def verify_payload(payload, source, streams_by_ident, pending, completed, bad):
         return "bad"
 
     now_ns = time.monotonic_ns()
+    now_wall_ns = time.time_ns()
     rtt_ms = (time.monotonic() - rec["sent_at"]) * 1000.0
     stream["verified"] += 1
     stream["replies"].append((parsed["seq"], parsed["rseq"]))
-    # Relative one-way delays: server receive stamp minus our send stamp, and
-    # our receive minus the server stamp. Each includes the unknown clock
-    # offset (once with each sign), so compare flows, never read them alone.
+    # One-way delays. Monotonic pair: server receive stamp minus our send
+    # stamp, and our receive minus the server stamp; each includes the
+    # unknown clock offset (once with each sign), so compare flows, never
+    # read them alone. Wall-clock pair: the same with system time, absolute
+    # once both clocks are known to be synchronised.
     recv_ns = parsed["recv_ns"]
+    recv_wall = parsed["recv_wall_ns"]
     stream["lat"].append(
         (
             now_ns - parsed["send_ns"],
             recv_ns - parsed["send_ns"] if recv_ns else None,
             now_ns - recv_ns if recv_ns else None,
+            recv_wall - parsed["send_wall_ns"] if recv_wall else None,
+            now_wall_ns - recv_wall if recv_wall else None,
         )
     )
     completed[key] = digest
@@ -1564,6 +1803,7 @@ def run_udp_client(args, dest_ip):
             break
 
     arrival_logs = None
+    server_clock = None
     if not args.no_directional:
         # Pull the arrival log over the same connected sockets the test used.
         def send_request(stream, data):
@@ -1590,12 +1830,13 @@ def run_udp_client(args, dest_ip):
             return replies
 
         arrival_logs = fetch_arrival_logs(args, streams, send_request, recv_replies)
+        server_clock = fetch_server_clock(args, streams, send_request, recv_replies)
 
     for stream in streams:
         stream["sock"].close()
 
     return print_client_stats(
-        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs
+        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs, server_clock
     )
 
 
@@ -1745,6 +1986,7 @@ def run_raw_tcp_client(args, dest_ip):
     unexpected = 0
     verified_total = 0
     arrival_logs = None
+    server_clock = None
 
     recv_sock, send_sock = open_raw_tcp_sockets()
     selector = selectors.DefaultSelector()
@@ -1867,12 +2109,13 @@ def run_raw_tcp_client(args, dest_ip):
                 return replies
 
             arrival_logs = fetch_arrival_logs(args, streams, send_request, recv_replies)
+            server_clock = fetch_server_clock(args, streams, send_request, recv_replies)
     finally:
         recv_sock.close()
         send_sock.close()
 
     return print_client_stats(
-        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs
+        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs, server_clock
     )
 
 
@@ -1882,6 +2125,12 @@ def run_raw_tcp_server(args):
     last_port = args.port + args.parallel - 1
     arrival_log = ArrivalLog()
     progress = ServerProgress(args.progress > 0)
+
+    def raw_tcp_chunk(nonce, kind, index):
+        if kind == KIND_CLOCK:
+            return chunk_of([clock_record()], kind, index)
+        return arrival_log.chunk(nonce, kind, index)
+
     print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
@@ -1903,7 +2152,7 @@ def run_raw_tcp_server(args):
             if args.bind != "0.0.0.0" and parsed["dest_ip"] != args.bind:
                 continue
 
-            echo_payload = serve_ctrl_request(arrival_log.chunk, parsed["payload"])
+            echo_payload = serve_ctrl_request(raw_tcp_chunk, parsed["payload"])
             if echo_payload is None:
                 if not parsed["payload"].startswith(MAGIC):
                     continue
@@ -1911,7 +2160,7 @@ def run_raw_tcp_server(args):
                 if not payload_meta:
                     continue
                 rseq = arrival_log.record(payload_meta["nonce"], payload_meta["seq"])
-                echo_payload = stamp_payload(parsed["payload"], rseq, time.monotonic_ns())
+                echo_payload = stamp_payload(parsed["payload"], rseq)
                 progress.add(payload_meta["nonce"], parsed["src_ip"])
             ack = (parsed["seq"] + len(parsed["payload"])) & 0xFFFFFFFF
             reply = make_raw_tcp_packet(
@@ -1961,6 +2210,8 @@ def run_udp_server(args):
     def server_chunk(nonce, kind, index):
         if kind == KIND_ARRIVALS:
             return arrival_log.chunk(nonce, kind, index)
+        if kind == KIND_CLOCK:
+            return chunk_of([clock_record()], kind, index)
         session = sessions.get(nonce)
         return session.chunk(kind, index) if session else None
 
@@ -2007,7 +2258,7 @@ def run_udp_server(args):
                             progress.add(meta["nonce"], addr[0])
                             continue
                         rseq = arrival_log.record(meta["nonce"], meta["seq"])
-                        data = stamp_payload(data, rseq, time.monotonic_ns())
+                        data = stamp_payload(data, rseq)
                         progress.add(meta["nonce"], addr[0])
                     key.fileobj.sendto(data, addr)
 
@@ -2180,7 +2431,7 @@ def run_udp_reverse_client(args, dest_ip):
                 if meta and meta["nonce"] in streams_by_nonce:
                     rseq = arrival_log.record(meta["nonce"], meta["seq"])
                     try:
-                        stream["sock"].send(stamp_payload(data, rseq, time.monotonic_ns()))
+                        stream["sock"].send(stamp_payload(data, rseq))
                     except OSError:
                         pass
                     progress.add(meta["nonce"], dest_ip)
