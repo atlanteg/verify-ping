@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2403,13 +2403,16 @@ def run_tcp_stream_roulette(args, dest_ip):
     answered = [row for row in rows if row["rtt_min"] is not None and row["rev_min"] is not None]
     if not answered:
         raise SystemExit("roulette: no connection got a verified reply; nothing to choose from")
-    answered.sort(key=lambda row: (row["rev_min"], row["rtt_min"]))
+    # Rank by the sum of per-direction minima: the forward path of an open
+    # connection cannot be changed any more, so the kept flow must be the
+    # best round trip, not merely the best return leg.
+    answered.sort(key=lambda row: (row["fwd_min"] + row["rev_min"], row["rev_min"]))
     rev_best = answered[0]["rev_min"]
     fwd_best = min(row["fwd_min"] for row in answered)
     bound, verdict = clock_verdict(args, client_clock, server_clock, answered[0]["rtt_min"])
 
     print()
-    print(f"--- roulette: {len(answered)} connections ranked by reverse (server -> client) delay ---")
+    print(f"--- roulette: {len(answered)} connections ranked by forward + reverse minima ---")
     print(f"{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
           + (f" {'rev_abs':>9} {'fwd_abs':>9}" if bound is not None else ""))
     for index, row in enumerate(answered[:10], 1):
@@ -2420,10 +2423,16 @@ def run_tcp_stream_roulette(args, dest_ip):
         print(line)
     if len(answered) > 10:
         print(f"  ... {len(answered) - 10} more")
-    rev_groups = group_paths(answered, "rev_min", int(args.hunt_tolerance * 1e6))
-    fast = len(rev_groups[0]["rows"])
-    print(f"reverse levels: {levels_phrase(rev_groups, int(args.hunt_tolerance * 1e6))}; "
-          f"{fast} of {len(answered)} connections ({100.0 * fast / len(answered):.1f}%) on the fastest")
+    tol = int(args.hunt_tolerance * 1e6)
+    for label, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
+        groups = group_paths(answered, key, tol)
+        fast = len(groups[0]["rows"])
+        print(f"{label} levels: {levels_phrase(groups, tol)}; "
+              f"{fast} of {len(answered)} connections ({100.0 * fast / len(answered):.1f}%) on the fastest")
+    both = [row for row in answered
+            if row["fwd_min"] - fwd_best <= tol and row["rev_min"] - rev_best <= tol]
+    print(f"fast in both directions: {len(both)} of {len(answered)} connections"
+          + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
     print(f"clocks: client {describe_clock(client_clock)}; server "
           f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
           f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")

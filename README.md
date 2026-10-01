@@ -304,9 +304,12 @@ and never let it go idle. `--roulette N` does exactly that over tcp-stream:
 ```
 
 It opens N connections (over the server's `-P` ports), probes each `-c`
-times, ranks them by reverse one-way delay (absolute when both clocks are
-synced, relative otherwise), prints the top ten with the share of
-connections that landed on the fastest level, keeps the best `--keep`
+times, ranks them by the sum of the forward and reverse minima — the
+forward path of an open connection cannot be changed any more, so the kept
+flow has to be the best round trip, not merely the best return leg —
+prints the top ten (one-way values absolute when both clocks are synced),
+the share of connections on the fastest level in each direction and how
+many are fast both ways, keeps the best `--keep`
 connections open, closes the rest, and then holds the kept ones — one probe
 per `-i` on each — printing a `--series` line per window (default 30 s)
 until `--hold` seconds pass or Ctrl+C. A final summary gives min / p50 / max
