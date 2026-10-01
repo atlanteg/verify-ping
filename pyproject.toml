@@ -1,6 +1,6 @@
 [project]
 name = "verify-ping"
-version = "0.12.2"
+dynamic = ["version"]
 description = "ICMP, UDP, raw TCP, and TCP stream echo tester with payload verification and per-direction loss/reordering attribution"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,3 +18,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["verify_ping"]
+
+[tool.setuptools.dynamic]
+version = {attr = "verify_ping.__version__"}

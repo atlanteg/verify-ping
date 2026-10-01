@@ -437,6 +437,10 @@ reply payload does not match the request.
 
 ## Notes
 
+Both sides print their version on start-up (`verify_ping v0.12.3 …`), and
+`--version` prints it alone. After a UDP, raw TCP or tcp-stream run the
+client also asks the server for its version and warns when the two differ.
+
 ICMP mode uses a raw ICMP socket, so `sudo` is normally required. Raw TCP mode
 also requires `sudo` on both sides. UDP and `tcp-stream` do not need raw sockets,
 but they do require the `verify-ping` echo server to be running on the other

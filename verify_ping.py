@@ -10,6 +10,9 @@ import sys
 import time
 
 
+__version__ = "0.12.3"
+VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
+
 ICMP_ECHO_REPLY = 0
 ICMP_ECHO_REQUEST = 8
 MAGIC = b"vpng4\x00\x00\x00"
@@ -56,13 +59,15 @@ KIND_ARRIVALS = 0           # echo side: seqs in arrival order            (!H)
 KIND_REPLIES = 1            # probe side: (seq, rseq) in reply order      (!HI)
 KIND_SUMMARY = 2            # probe side: sent, verified, bad, dup, unexpected, done
 KIND_CLOCK = 3              # either side: synced, esterror_us, maxerror_us, source
+KIND_VERSION = 4            # either side: major, minor, patch
 KIND_ENTRY_FMT = {
     KIND_ARRIVALS: "!H",
     KIND_REPLIES: "!HI",
     KIND_SUMMARY: "!HHHHHB",
     KIND_CLOCK: "!BQQB",
+    KIND_VERSION: "!HHH",
 }
-KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1, KIND_CLOCK: 1}
+KIND_CHUNK_ENTRIES = {KIND_ARRIVALS: 512, KIND_REPLIES: 170, KIND_SUMMARY: 1, KIND_CLOCK: 1, KIND_VERSION: 1}
 CLOCK_UNKNOWN, CLOCK_KERNEL, CLOCK_TIMEDATECTL, CLOCK_CHRONY, CLOCK_KERNEL_MAX = 0, 1, 2, 3, 4
 CLOCK_SOURCE_NAMES = {
     CLOCK_UNKNOWN: "unknown",
@@ -647,12 +652,46 @@ def fetch_arrival_logs(args, streams, send_request, recv_replies):
 
 
 def fetch_server_clock(args, streams, send_request, recv_replies):
-    """The echo side's clock status, or None if it cannot be fetched."""
+    """The echo side's clock status (with its version under "version"), or None."""
     logs = fetch_logs(args, streams[:1], send_request, recv_replies, KIND_CLOCK, budget=3.0)
     if not logs:
         return None
     entries = logs.get(streams[0]["stream"])
-    return clock_from_record(entries[0]) if entries else None
+    if not entries:
+        return None
+    clock = clock_from_record(entries[0])
+    versions = fetch_logs(args, streams[:1], send_request, recv_replies, KIND_VERSION, budget=2.0)
+    entry = (versions or {}).get(streams[0]["stream"])
+    clock["version"] = tuple(entry[0]) if entry else None
+    return clock
+
+
+def info_chunk(kind, index):
+    """KIND_CLOCK / KIND_VERSION answers every server gives; None for other kinds."""
+    if kind == KIND_CLOCK:
+        return chunk_of([clock_record()], kind, index)
+    if kind == KIND_VERSION:
+        return chunk_of([VERSION_TUPLE], kind, index)
+    return None
+
+
+def version_text(version):
+    return ".".join(str(part) for part in version) if version else "unknown"
+
+
+def print_server_version(server_clock):
+    if not server_clock:
+        return
+    version = server_clock.get("version")
+    if version is None:
+        print(f"server version: unknown (client {__version__})")
+    elif tuple(version) != VERSION_TUPLE:
+        print(
+            f"server version {version_text(version)} differs from client {__version__}: "
+            f"update both sides to the same release"
+        )
+    else:
+        print(f"server version {version_text(version)} (same as client)")
 
 
 def fetch_logs(args, streams, send_request, recv_replies, kind, budget=None):
@@ -685,6 +724,7 @@ def fetch_logs(args, streams, send_request, recv_replies, kind, budget=None):
         KIND_REPLIES: "reply log",
         KIND_SUMMARY: "summary",
         KIND_CLOCK: "clock status",
+        KIND_VERSION: "version",
     }[kind]
 
     while time.monotonic() < deadline:
@@ -965,6 +1005,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Payload-verifying ICMP/UDP/TCP echo tester."
     )
+    parser.add_argument("--version", action="version", version=f"verify_ping {__version__}")
     parser.add_argument("host", nargs="?", help="destination host for client mode")
     parser.add_argument(
         "--protocol",
@@ -1204,7 +1245,7 @@ def print_client_header(args, dest_ip, streams):
     target_total = args.count * stream_count(args)
     endpoint = endpoint_label(args, dest_ip)
     print(
-        f"verify_ping {args.protocol} {endpoint}: {args.count} packets/stream, "
+        f"verify_ping v{__version__} {args.protocol} {endpoint}: {args.count} packets/stream, "
         f"{stream_count(args)} streams, {target_total} total packets, {args.size} data bytes, "
         f"interval {args.interval}s, ids {ident_range(streams)}"
         + (f", path hunt over {args.parallel} server port(s)" if args.hunt else "")
@@ -1230,6 +1271,7 @@ def print_client_stats(
         f"loss={loss_percent(sent_total, lost):.3f}% duplicates={duplicates} unexpected={unexpected}"
     )
     print(f"checked_payload={fmt_bytes(checked_bytes)} elapsed={elapsed:.3f}s")
+    print_server_version(server_clock)
 
     if stream_count(args) > 1 and not args.hunt:
         pending_by_stream = {stream["stream"]: 0 for stream in streams}
@@ -2390,11 +2432,10 @@ def run_raw_tcp_server(args):
     progress = ServerProgress(args.progress > 0, "tcp (raw)")
 
     def raw_tcp_chunk(nonce, kind, index):
-        if kind == KIND_CLOCK:
-            return chunk_of([clock_record()], kind, index)
-        return arrival_log.chunk(nonce, kind, index)
+        info = info_chunk(kind, index)
+        return info if info is not None else arrival_log.chunk(nonce, kind, index)
 
-    print(f"verify_ping raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
+    print(f"verify_ping v{__version__} raw tcp echo server listening on {args.bind}:{port_range(args)}", flush=True)
     print("raw tcp mode ignores non-test TCP packets, including kernel-generated RST", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
@@ -2467,14 +2508,15 @@ def run_udp_server(args):
     sessions = {}  # -R runs we are probing, keyed by client nonce
     progress = ServerProgress(args.progress > 0, "udp")
     actual_host = sockets[0].getsockname()[0]
-    print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
+    print(f"verify_ping v{__version__} udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
 
     def server_chunk(nonce, kind, index):
         if kind == KIND_ARRIVALS:
             return arrival_log.chunk(nonce, kind, index)
-        if kind == KIND_CLOCK:
-            return chunk_of([clock_record()], kind, index)
+        info = info_chunk(kind, index)
+        if info is not None:
+            return info
         session = sessions.get(nonce)
         return session.chunk(kind, index) if session else None
 
@@ -2568,7 +2610,7 @@ def run_udp_reverse_client(args, dest_ip):
 
     endpoint = endpoint_label(args, dest_ip)
     print(
-        f"verify_ping udp -R {endpoint}: server probes {args.count} packets/stream, "
+        f"verify_ping v{__version__} udp -R {endpoint}: server probes {args.count} packets/stream, "
         f"{args.parallel} streams, {args.count * args.parallel} total packets, {args.size} data bytes, "
         f"interval {args.interval}s, ids {ident_range(streams)}; this client echoes"
     )
@@ -2815,7 +2857,7 @@ def run_tcp_stream_server(args):
         listeners.append(server)
 
     actual_host = listeners[0].getsockname()[0]
-    print(f"verify_ping tcp-stream echo server listening on {actual_host}:{port_range(args)}", flush=True)
+    print(f"verify_ping v{__version__} tcp-stream echo server listening on {actual_host}:{port_range(args)}", flush=True)
     print("frames are stamped like udp, so tcp-stream yields one-way delays too", flush=True)
     peers = {}
     peer_ips = {}
@@ -2826,9 +2868,8 @@ def run_tcp_stream_server(args):
     progress = ServerProgress(chatty, "tcp-stream")
 
     def stream_chunk(nonce, kind, index):
-        if kind == KIND_CLOCK:
-            return chunk_of([clock_record()], kind, index)
-        return arrival_log.chunk(nonce, kind, index)
+        info = info_chunk(kind, index)
+        return info if info is not None else arrival_log.chunk(nonce, kind, index)
 
     def close_conn(conn, fileno, why):
         selector.unregister(conn)
@@ -3013,7 +3054,7 @@ def run_icmp_observer(args):
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
     progress = ServerProgress(args.progress > 0, "icmp (observed; kernel answers)")
-    print("verify_ping icmp observer: showing echo requests that carry verify_ping payloads", flush=True)
+    print(f"verify_ping v{__version__} icmp observer: showing echo requests that carry verify_ping payloads", flush=True)
 
     try:
         while True:
@@ -3076,6 +3117,7 @@ def run_multi_server(args):
             with lock:
                 failures.append(f"{protocol} server crashed: {exc!r}")
 
+    print(f"verify_ping v{__version__} server: {', '.join(args.protocols)} on port(s) {port_range(args)}", flush=True)
     threads = []
     for protocol in args.protocols:
         thread = threading.Thread(target=runner, args=(protocol,), daemon=True, name=protocol)
