@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1004,136 +1004,141 @@ def loss_percent(sent, lost):
     return lost * 100.0 / sent
 
 
+HELP_EPILOG = """\
+modes (pick one; everything else refines it):
+  client            verify_ping.py HOST [--protocol P] ...        probe HOST, report loss/reorder per direction
+  server            verify_ping.py --server --protocol all ...    echo side, one process for udp+tcp+tcp-stream+icmp
+  path hunt         verify_ping.py HOST --hunt N ...               N flows on different ports, ranked per direction
+  roulette          verify_ping.py HOST --roulette N ...           open N udp and tcp flows, keep the best, hold it
+  pin / re-test     verify_ping.py HOST --src-port S --port D ...  measure one exact 5-tuple again (+ --series)
+  reverse           verify_ping.py HOST -R ...                     server probes, client echoes (udp)
+  port check        verify_ping.py --check-ports --port P -P 8     are the server ports free for udp and tcp?
+
+examples:
+  # remote side, once (udp + raw tcp + tcp-stream + icmp observer on 20100..20107)
+  sudo verify_ping.py --server --protocol all --port 20100 -P 8
+
+  # plain loss test, 3000 x 500 B at 10 pkt/s, with forward/reverse attribution
+  verify_ping.py 10.0.0.1 --protocol udp --port 20100 -c 3000 -i 0.1 -s 500
+
+  # which ports land on the fastest paths, all protocols, 64 flows each
+  sudo verify_ping.py 10.0.0.1 --protocol all --port 20100 -P 8 --hunt 64 -c 50 -i 0.2
+
+  # open 100 udp and 100 tcp flows, keep the best of each, hold 30 min, a line every 30 s
+  sudo verify_ping.py 10.0.0.1 --roulette 100 --port 20100 -P 8 -c 30 -i 0.2 --hold 1800 --series 30
+
+  # re-test the flow the hunt found, watching its path for 10 minutes
+  verify_ping.py 10.0.0.1 --protocol tcp-stream --port 20103 -P 1 --src-port 43438 -c 12000 -i 0.05 --series 30
+
+before sending, the client prints the load it will generate (pkt/s, bit/s per direction)
+and waits for Enter; -y skips that. Raw tcp and icmp need root. Both sides must run the
+same version; the client checks the server's and warns. Full documentation: README.md
+"""
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Payload-verifying ICMP/UDP/TCP echo tester."
+        description=(
+            "Packet-loss, reordering and latency tester with a unique, SHA-256-verified payload in "
+            "every packet. Attributes loss and reordering to the forward or reverse path, measures "
+            "one-way delay per direction (relative always, absolute when both clocks are synced), "
+            "hunts ECMP paths by varying ports, and can pick and hold the fastest flow."
+        ),
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("host", nargs="?", help="destination host (client modes)")
     parser.add_argument("--version", action="version", version=f"verify_ping {__version__}")
-    parser.add_argument("host", nargs="?", help="destination host for client mode")
-    parser.add_argument(
+
+    mode = parser.add_argument_group("mode")
+    mode.add_argument(
         "--protocol",
         default="icmp",
-        help="transport to test: icmp, udp, tcp or tcp-stream; with --hunt a comma-separated "
-        "list runs them one after another (e.g. udp,tcp,icmp)",
+        metavar="P[,P..]",
+        help="icmp, udp, tcp (raw segments), tcp-stream (real connections) or all. Client default: icmp. "
+        "Several, comma-separated, are allowed with --hunt, --roulette and --server",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--server",
         "--listen",
         action="store_true",
-        help="run the echo server instead of a client; --protocol may list several "
-        "(udp,tcp,tcp-stream,icmp or all) to serve them all from one process on the same ports; "
-        "icmp only observes (the kernel answers echo) and needs root",
+        help="run the echo side instead of a client; serves every listed protocol from one process on the "
+        "same ports (icmp only observes: the kernel answers echo). Needs root for tcp and icmp",
     )
-    parser.add_argument(
-        "--bind",
-        default="0.0.0.0",
-        help="server bind address for UDP/TCP; raw TCP uses it only for display/filtering",
-    )
-    parser.add_argument(
-        "-p",
-        "--port",
-        type=int,
-        default=None,
-        help="UDP/TCP port; server uses a random high port when omitted",
-    )
-    parser.add_argument("-c", "--count", type=int, default=3000, help="packet count per stream")
-    parser.add_argument("-i", "--interval", type=float, default=0.08, help="send interval in seconds")
-    parser.add_argument("-s", "--size", type=int, default=1200, help="payload size in bytes")
-    parser.add_argument(
-        "-P",
-        "--parallel",
-        "--threads",
-        type=int,
-        default=1,
-        help="parallel measurement streams to run",
-    )
-    parser.add_argument("-W", "--timeout", type=float, default=3.0, help="seconds to wait after last send")
-    parser.add_argument(
-        "--progress",
-        type=int,
-        default=None,
-        help="client: print progress every N verified replies (default 100, 0 under --hunt); "
-        "server: per-second rx line (0 disables)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
-    parser.add_argument(
-        "--no-directional",
-        action="store_true",
-        help="skip the post-run arrival log fetch; report round-trip stats only",
-    )
-    parser.add_argument(
+    mode.add_argument(
         "--hunt",
         type=int,
         default=0,
-        metavar="FLOWS",
-        help="path hunt: run FLOWS interleaved flows with different source/destination ports "
-        "(ICMP: identifiers) to land on different ECMP paths, then rank them by round-trip "
-        "and by relative one-way delay in each direction",
+        metavar="N",
+        help="path hunt: N interleaved flows with different source ports (and dest ports from the -P range; "
+        "icmp: identifiers), ranked by round trip and by one-way delay per direction",
     )
-    parser.add_argument(
-        "--hunt-tolerance",
-        type=float,
-        default=0.15,
-        metavar="MS",
-        help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
-    )
-    parser.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        help="client: skip the load estimate confirmation prompt (it is also skipped when stdin is not a terminal)",
-    )
-    parser.add_argument(
+    mode.add_argument(
         "--roulette",
         type=int,
         default=0,
         metavar="N",
-        help="tcp-stream: open N connections, rank them by reverse one-way delay, keep the "
-        "best --keep ones alive (closing the rest) and keep measuring them with --series",
+        help="open N udp and N tcp-stream flows (default both, concurrently; --protocol picks one), rank by "
+        "forward+reverse minima, keep the best --keep, close the rest and hold them alive with --series lines",
     )
-    parser.add_argument("--keep", type=int, default=1, help="connections to keep in --roulette (default 1)")
-    parser.add_argument(
-        "--hold",
-        type=float,
-        default=0,
-        metavar="SECONDS",
-        help="how long --roulette holds the kept connections (default: until Ctrl+C)",
-    )
-    parser.add_argument(
-        "--series",
-        type=float,
-        default=0,
-        metavar="SECONDS",
-        help="client: every SECONDS print the window's rtt min/p50 and one-way minima, to watch a "
-        "flow's path over time (udp, tcp, tcp-stream)",
-    )
-    parser.add_argument(
-        "--src-port",
-        type=int,
-        default=None,
-        metavar="PORT",
-        help="client: fixed source port for stream 1 (stream N uses PORT+N-1), to re-test a "
-        "5-tuple that --hunt found; udp, tcp and tcp-stream",
-    )
-    parser.add_argument(
-        "--check-ports",
-        action="store_true",
-        help="server side: try to bind every port of the --port/-P range over UDP and TCP, "
-        "report which are free, and exit (nothing stays bound)",
-    )
-    parser.add_argument(
-        "--wallclock",
-        action="store_true",
-        help="print absolute one-way delays even when a clock is not reported as synchronised "
-        "(the values then include the clock offset between the hosts)",
-    )
-    parser.add_argument(
+    mode.add_argument(
         "-R",
         "--reverse",
         action="store_true",
-        help="reverse roles: connect as usual, then the server probes and this client echoes; "
-        "the report is still printed here (udp only)",
+        help="reverse roles like iperf3 -R: connect as usual, then the server probes and this client echoes; "
+        "the report is still printed here (udp only; does not change who connects)",
     )
+    mode.add_argument(
+        "--check-ports",
+        action="store_true",
+        help="server host: try to bind every port of --port/-P over udp and tcp, report free/BUSY, exit",
+    )
+
+    test = parser.add_argument_group("test parameters")
+    test.add_argument("-p", "--port", type=int, default=None, metavar="PORT",
+                      help="first udp/tcp port; -P consecutive ports follow (server picks a random one if omitted)")
+    test.add_argument("-P", "--parallel", "--threads", type=int, default=1, metavar="N",
+                      help="parallel streams on the client / consecutive ports on the server (default 1). "
+                           "Under --hunt and --roulette: the number of server ports to spread flows over")
+    test.add_argument("-c", "--count", type=int, default=3000, metavar="N",
+                      help="probes per stream (default 3000, max 65535)")
+    test.add_argument("-i", "--interval", type=float, default=0.08, metavar="SEC",
+                      help="seconds between probes per stream (default 0.08); flows are phase-shifted so "
+                           "a round never leaves as one burst")
+    test.add_argument("-s", "--size", type=int, default=1200, metavar="BYTES",
+                      help="payload bytes (default 1200, minimum 70)")
+    test.add_argument("-W", "--timeout", type=float, default=3.0, metavar="SEC",
+                      help="seconds to wait for late replies after the last probe (default 3)")
+    test.add_argument("--src-port", type=int, default=None, metavar="PORT",
+                      help="pin the client source port of stream 1 (stream N gets PORT+N-1) to re-test an exact "
+                           "5-tuple; udp, tcp and tcp-stream. Re-running the same tcp 4-tuple within 60 s needs "
+                           "net.ipv4.tcp_tw_reuse=1")
+    test.add_argument("--bind", default="0.0.0.0", metavar="ADDR",
+                      help="server bind address (default 0.0.0.0); raw tcp uses it only for filtering")
+
+    hunt = parser.add_argument_group("path hunt and roulette")
+    hunt.add_argument("--hunt-tolerance", type=float, default=0.15, metavar="MS",
+                      help="minima closer than MS ms belong to the same path level (default 0.15)")
+    hunt.add_argument("--keep", type=int, default=1, metavar="K",
+                      help="flows to keep per protocol in --roulette (default 1)")
+    hunt.add_argument("--hold", type=float, default=0, metavar="SEC",
+                      help="how long --roulette holds the kept flows (default: until Ctrl+C)")
+
+    out = parser.add_argument_group("output")
+    out.add_argument("--series", type=float, default=0, metavar="SEC",
+                     help="every SEC seconds print the window's rtt min/p50 and one-way minima (udp, tcp, "
+                          "tcp-stream); --roulette's hold phase uses 30 s when unset")
+    out.add_argument("--progress", type=int, default=None, metavar="N",
+                     help="client: a line every N verified replies (default 100; 0 under --hunt/--roulette); "
+                          "server: per-second rx line (0 silences)")
+    out.add_argument("-v", "--verbose", action="store_true", help="print every verified reply")
+    out.add_argument("--no-directional", action="store_true",
+                     help="skip the post-run in-band fetch; report round-trip statistics only")
+    out.add_argument("--wallclock", action="store_true",
+                     help="print absolute one-way delays even when a clock is not reported synced "
+                          "(the values then include the clock offset)")
+    out.add_argument("-y", "--yes", action="store_true",
+                     help="skip the load-estimate confirmation (also skipped when stdin is not a terminal)")
     return parser.parse_args()
 
 
