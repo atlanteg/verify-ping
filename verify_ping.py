@@ -1130,8 +1130,14 @@ def build_streams(args):
     started = time.monotonic()
     streams = []
     used_idents = set()
+    count = stream_count(args)
+    # Spread the streams' send phases evenly over one interval. Starting
+    # them all at once would put every probe of a round on the wire as one
+    # burst, and the self-inflicted queueing would land on the same flows
+    # every time, biasing their minima.
+    phase = args.interval / count if count > 1 else 0.0
 
-    for stream_no in range(1, stream_count(args) + 1):
+    for stream_no in range(1, count + 1):
         ident = (base_ident + stream_no - 1) & 0xFFFF
         if ident in used_idents:
             raise SystemExit("parallel produced duplicate identifiers")
@@ -1144,7 +1150,7 @@ def build_streams(args):
                 "sent": 0,
                 "verified": 0,
                 "bad": 0,
-                "next_send": started,
+                "next_send": started + (stream_no - 1) * phase,
                 "last_send": None,
                 "sock": None,
                 "out": bytearray(),
@@ -1484,17 +1490,25 @@ def group_paths(rows, key, tolerance_ns):
 
 
 def levels_phrase(groups, tolerance_ns):
-    """'2 level(s)' plus notes on single-flow outliers and continuous spread."""
+    """'2 level(s) +1 outlier(s)' -- short; the queueing note is printed once elsewhere."""
     solid = [group for group in groups if len(group["rows"]) > 1]
     singles = len(groups) - len(solid)
     text = f"{len(solid)} level(s)"
     if singles:
-        text += f" +{singles} single-flow outlier(s)"
-    wide = [group for group in solid if group["last"] - group["best"] > 2 * tolerance_ns]
-    if wide:
-        widest = max(group["last"] - group["best"] for group in wide)
-        text += f"; continuous spread up to {ms(widest)} ms inside a level (queueing rather than distinct paths; more -c sharpens minima)"
+        text += f" +{singles} outlier(s)"
     return text
+
+
+def widest_level_ns(groups, tolerance_ns):
+    """Largest inside-level spread beyond 2x tolerance, or 0 if every level is tight."""
+    wide = [group["last"] - group["best"] for group in groups
+            if len(group["rows"]) > 1 and group["last"] - group["best"] > 2 * tolerance_ns]
+    return max(wide) if wide else 0
+
+
+def spread_ns(rows, key):
+    values = [row[key] for row in rows if row[key] is not None]
+    return (max(values) - min(values)) if values else 0
 
 
 def flows_phrase(flows, total):
@@ -1590,8 +1604,8 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
         rev_groups = group_paths(answered, "rev_min", tolerance_ns)
         fwd_flows = {row["stream"] for row in fwd_groups[0]["rows"]}
         rev_flows = {row["stream"] for row in rev_groups[0]["rows"]}
-        fwd_spread = fwd_groups[-1]["best"] - fwd_groups[0]["best"]
-        rev_spread = rev_groups[-1]["best"] - rev_groups[0]["best"]
+        fwd_spread = spread_ns(answered, "fwd_min")
+        rev_spread = spread_ns(answered, "rev_min")
         best["fwd"] = fwd_groups[0]
         best["rev"] = rev_groups[0]
         best["fwd_levels"], best["rev_levels"] = len(fwd_groups), len(rev_groups)
@@ -1614,6 +1628,12 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
             )
         else:
             print("  no flow is fastest both ways (asymmetric ECMP)")
+        widest = max(widest_level_ns(fwd_groups, tolerance_ns), widest_level_ns(rev_groups, tolerance_ns))
+        if widest:
+            print(
+                f"  note: minima inside a level spread continuously by up to {ms(widest)} ms -- "
+                f"queueing rather than distinct paths; more probes per flow (-c) sharpen them"
+            )
         print("  one-way figures above are relative to the best flow in each direction")
         client = clock_status()
         bound, verdict = clock_verdict(args, client, server_clock, best_rtt_row["rtt_min"])
@@ -2814,6 +2834,19 @@ def run_tcp_stream_server(args):
                                 progress.add(meta["nonce"], peer_ips.get(fileno, "?"))
                             reply = payload
                         buffers[fileno].extend(frame(reply))
+                    if not buffers[fileno]:
+                        continue
+                    # Echo right away like the UDP server does; waiting for the
+                    # next select() pass would add the whole batch's processing
+                    # time to every connection's round trip.
+                    try:
+                        sent = conn.send(buffers[fileno])
+                        del buffers[fileno][:sent]
+                    except BlockingIOError:
+                        pass
+                    except (BrokenPipeError, ConnectionResetError):
+                        close_conn(conn, fileno, "reset")
+                        continue
                     if not buffers[fileno]:
                         continue
                     selector.modify(

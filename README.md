@@ -168,7 +168,10 @@ the server's `-P` range; ICMP varies the identifier), and ranks them:
 ```
 
 `-P` is the number of server ports to spread over (must match the server),
-`--hunt` the number of flows; flows wrap around the port range. With a
+`--hunt` the number of flows; flows wrap around the port range. Flows are
+phase-shifted evenly across one interval, so a round of probes never leaves
+as one burst that would queue behind itself and bias the same flows' minima
+every time. With a
 comma-separated `--protocol` list the protocols run one after another and a
 cross-protocol summary follows. Raw TCP and ICMP still need `sudo`.
 
