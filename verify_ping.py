@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.5"
+__version__ = "0.12.6"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1544,10 +1544,21 @@ def group_paths(rows, key, tolerance_ns):
 
 
 def levels_phrase(groups, tolerance_ns):
-    """'2 level(s) +1 outlier(s)' -- short; the queueing note is printed once elsewhere."""
+    """'3 level(s) [+0.00 ms x2, +3.03 ms x16, +6.02 ms x9] +1 outlier(s)'.
+
+    Each level is shown as its offset from the best one with the number of
+    flows that landed on it, which is what a reader wants to know: how far
+    apart the paths are and how likely a random flow is to hit the fast one.
+    The queueing note is printed once elsewhere.
+    """
     solid = [group for group in groups if len(group["rows"]) > 1]
     singles = len(groups) - len(solid)
+    base = groups[0]["best"] if groups else 0
     text = f"{len(solid)} level(s)"
+    if solid:
+        text += " [" + ", ".join(
+            f"+{ms(group['best'] - base)} ms x{len(group['rows'])}" for group in solid
+        ) + "]"
     if singles:
         text += f" +{singles} outlier(s)"
     return text
