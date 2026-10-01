@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.4"
+__version__ = "0.12.5"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2987,18 +2987,6 @@ def run_tcp_stream_server(args):
     return 0
 
 
-def main():
-    args = parse_args()
-    validate_args(args)
-
-    if args.check_ports:
-        return check_ports(args)
-    if args.server:
-        if len(args.protocols) > 1:
-            return run_multi_server(args)
-        return run_server(args)
-
-
 def check_ports(args):
     """Bind each port of the range over UDP and TCP the way the servers would, then let go."""
     low, high = ephemeral_port_range()
@@ -3030,6 +3018,19 @@ def check_ports(args):
     else:
         print("all ports free for udp and tcp")
     return 1 if busy else 0
+
+
+def main():
+    args = parse_args()
+    validate_args(args)
+
+    if args.check_ports:
+        return check_ports(args)
+    if args.server:
+        if len(args.protocols) > 1:
+            return run_multi_server(args)
+        return run_server(args)
+
 
     dest_ip = socket.gethostbyname(args.host)
     if not args.hunt:
