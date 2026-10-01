@@ -1052,7 +1052,9 @@ def parse_args():
 def validate_args(args):
     protocols = [item.strip() for item in args.protocol.split(",") if item.strip()]
     if protocols == ["all"]:
-        protocols = ["udp", "tcp", "tcp-stream", "icmp"]
+        # Client: reachability first (icmp), then the modes that work through
+        # NAT (udp, tcp-stream), raw tcp last. Server: order is irrelevant.
+        protocols = ["udp", "tcp", "tcp-stream", "icmp"] if args.server else ["icmp", "udp", "tcp-stream", "tcp"]
     if not protocols:
         raise SystemExit("protocol is required")
     for item in protocols:
@@ -1223,7 +1225,7 @@ def print_client_stats(
     print()
     print(f"--- {endpoint} verified {args.protocol} statistics ---")
     print(
-        f"streams={stream_count(args)} count_per_stream={args.count} sent={sent_total} "
+        f"streams={len(streams)} count_per_stream={args.count} sent={sent_total} "
         f"verified={verified_total} lost={lost} bad_payload={len(bad)} "
         f"loss={loss_percent(sent_total, lost):.3f}% duplicates={duplicates} unexpected={unexpected}"
     )
@@ -2015,19 +2017,21 @@ def run_tcp_stream_client(args, dest_ip):
 
     selector = selectors.DefaultSelector()
     socket_to_stream = {}
-    for stream in streams:
-        port = stream_port(args, stream)
-        try:
-            sock = socket.create_connection((dest_ip, port), timeout=args.timeout)
-        except OSError as exc:
-            raise SystemExit(f"tcp connect to {dest_ip}:{port} failed: {exc}") from exc
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setblocking(False)
-        stream["sock"] = sock
-        stream["port"] = port
-        stream["src_port"] = sock.getsockname()[1]
-        socket_to_stream[sock.fileno()] = stream
-        selector.register(sock, selectors.EVENT_READ)
+    streams, failures = connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream)
+    if failures:
+        for port, why in failures:
+            print(f"tcp connect to {dest_ip}:{port} failed: {why}")
+    if not streams:
+        raise SystemExit(
+            f"tcp-stream: no connection to {dest_ip}:{port_range(args)} could be established "
+            f"({'timed out' if all('timed out' in why for _p, why in failures) else 'see above'}); "
+            f"'timed out' means nothing came back at all (filtered by a firewall, or no host), "
+            f"'refused' would mean the host answered but nothing listens on that port"
+        )
+    if failures:
+        print(f"continuing with {len(streams)} connected stream(s)")
+    streams_by_ident = {stream["ident"]: stream for stream in streams}
+    target_total = args.count * len(streams)
 
     print_client_header(args, dest_ip, streams)
 
@@ -2149,6 +2153,59 @@ def run_tcp_stream_client(args, dest_ip):
     return print_client_stats(
         args, dest_ip, started, streams, pending, bad, duplicates, unexpected, None, server_clock
     )
+
+
+def connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream):
+    """Open every stream's TCP connection at once, non-blocking, with one shared deadline.
+
+    Returns (connected streams, [(port, reason)] for the rest). Serial
+    blocking connects would spend one full timeout per filtered port, and a
+    single failure should not abort the streams that do connect.
+    """
+    import errno
+
+    pending = {}
+    connected = []
+    failures = []
+    for stream in streams:
+        port = stream_port(args, stream)
+        stream["port"] = port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        code = sock.connect_ex((dest_ip, port))
+        if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN):
+            failures.append((port, os.strerror(code)))
+            sock.close()
+            continue
+        pending[sock] = stream
+
+    deadline = time.monotonic() + args.timeout
+    wait = selectors.DefaultSelector()
+    for sock in pending:
+        wait.register(sock, selectors.EVENT_WRITE)
+    while pending and time.monotonic() < deadline:
+        for key, _mask in wait.select(max(0.0, deadline - time.monotonic())):
+            sock = key.fileobj
+            stream = pending.pop(sock)
+            wait.unregister(sock)
+            code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if code:
+                failures.append((stream["port"], os.strerror(code)))
+                sock.close()
+                continue
+            stream["sock"] = sock
+            stream["src_port"] = sock.getsockname()[1]
+            socket_to_stream[sock.fileno()] = stream
+            selector.register(sock, selectors.EVENT_READ)
+            connected.append(stream)
+    for sock, stream in pending.items():
+        wait.unregister(sock)
+        failures.append((stream["port"], f"timed out after {args.timeout:g}s"))
+        sock.close()
+    wait.close()
+    connected.sort(key=lambda stream: stream["stream"])
+    return connected, sorted(set(failures))
 
 
 def assign_raw_tcp_source_ports(streams, scatter=False):
@@ -2898,7 +2955,15 @@ def main():
         if len(args.protocols) > 1:
             print()
             print(f"===== {protocol} =====")
-        codes.append(run_client(args, dest_ip))
+        try:
+            codes.append(run_client(args, dest_ip))
+        except SystemExit as exc:
+            # One protocol failing to start must not cost us the others.
+            message = str(exc)
+            print(message if message.startswith(f"{protocol}:") else f"{protocol}: {message}")
+            print(f"{protocol}: skipped, continuing with the next protocol")
+            HUNT_RESULTS.append({"protocol": protocol, "rows": [], "groups": [], "best": {}})
+            codes.append(1)
     print_hunt_summary(dest_ip)
     return max(codes)
 

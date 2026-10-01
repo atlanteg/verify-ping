@@ -191,7 +191,13 @@ Pick a `--port` range **outside the local ephemeral port range** (Linux:
 that range may be taken by an *outgoing* connection at any moment; `bind()`
 then fails with "Address already in use" although `netstat -l` shows nothing.
 The server says so when it happens. Ports like `20100–20107` are safe.
-On the client, `--protocol all` means `udp,tcp,tcp-stream,icmp`.
+On the client, `--protocol all` means `icmp,udp,tcp-stream,tcp` — reachability
+first, then the modes that work through NAT, raw TCP last. A protocol that
+cannot start (no connection, no root) is reported and skipped; the others
+still run. `tcp-stream` opens all its connections at once with one shared
+timeout and carries on with those that succeed, naming the rest: *timed
+out* means nothing came back at all (filtered, or no host), *refused* means
+the host answered but nothing listens on that port.
 
 Each protocol prints a table sorted by minimum RTT:
 
