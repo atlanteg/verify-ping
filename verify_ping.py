@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.9"
+__version__ = "0.13.0"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1075,6 +1075,14 @@ def parse_args():
         help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
     )
     parser.add_argument(
+        "--series",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="client: every SECONDS print the window's rtt min/p50 and one-way minima, to watch a "
+        "flow's path over time (udp, tcp, tcp-stream)",
+    )
+    parser.add_argument(
         "--src-port",
         type=int,
         default=None,
@@ -1799,6 +1807,50 @@ def print_hunt_summary(dest_ip):
         )
 
 
+class SeriesReporter:
+    """Periodic line with the latest window's latencies, for watching a path over time.
+
+    One-way values are the raw wall-clock differences; whether the clocks make
+    them absolute is only known from the clock status fetched at the end, so
+    the final one-way block remains the authority. Within one run they are
+    consistent, which is what a step change needs.
+    """
+
+    def __init__(self, args, streams):
+        self.every = args.series
+        self.streams = streams
+        self.seen = {stream["stream"]: 0 for stream in streams}
+        self.next_at = time.monotonic() + self.every if self.every else None
+        self.sent_seen = 0
+
+    def tick(self):
+        if not self.next_at or time.monotonic() < self.next_at:
+            return
+        self.next_at += self.every
+        rtts, fwd, rev = [], [], []
+        for stream in self.streams:
+            lat = stream["lat"]
+            start = self.seen[stream["stream"]]
+            for item in lat[start:]:
+                rtts.append(item[0])
+                if item[3] is not None:
+                    fwd.append(item[3])
+                    rev.append(item[4])
+            self.seen[stream["stream"]] = len(lat)
+        sent = sum(stream["sent"] for stream in self.streams)
+        sent_window = sent - self.sent_seen
+        self.sent_seen = sent
+        stamp = time.strftime("%H:%M:%S")
+        if not rtts:
+            print(f"[{stamp}] no replies in this window ({sent_window} sent)", flush=True)
+            return
+        line = f"[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
+        if fwd:
+            line += f" | fwd min {ms(min(fwd))} | rev min {ms(min(rev))} ms"
+        line += f"  ({len(rtts)}/{sent_window} replies)"
+        print(line, flush=True)
+
+
 def make_stream_payload(args, stream):
     seq = stream["sent"] + 1
     payload = make_payload(
@@ -1923,6 +1975,7 @@ def run_icmp_client(args, dest_ip):
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
     print_client_header(args, dest_ip, streams)
+    series = SeriesReporter(args, streams)
 
     while sum(stream["sent"] for stream in streams) < target_total or pending:
         now = time.monotonic()
@@ -1968,6 +2021,7 @@ def run_icmp_client(args, dest_ip):
                             f"seq={seq} from={src[0]} rtt={rtt_ms:.3f} ms"
                         )
 
+        series.tick()
         if should_stop_waiting(args, streams, pending, target_total):
             break
 
@@ -2003,6 +2057,7 @@ def run_udp_client(args, dest_ip):
         selector.register(sock, selectors.EVENT_READ)
 
     print_client_header(args, dest_ip, streams)
+    series = SeriesReporter(args, streams)
 
     while sum(stream["sent"] for stream in streams) < target_total or pending:
         now = time.monotonic()
@@ -2058,6 +2113,7 @@ def run_udp_client(args, dest_ip):
                             f"seq={rec['seq']} from={dest_ip}:{stream['port']} rtt={rtt_ms:.3f} ms"
                         )
 
+        series.tick()
         if should_stop_waiting(args, streams, pending, target_total):
             break
 
@@ -2131,6 +2187,7 @@ def run_tcp_stream_client(args, dest_ip):
     target_total = args.count * len(streams)
 
     print_client_header(args, dest_ip, streams)
+    series = SeriesReporter(args, streams)
 
     while sum(stream["sent"] for stream in streams) < target_total or pending:
         now = time.monotonic()
@@ -2196,6 +2253,7 @@ def run_tcp_stream_client(args, dest_ip):
                                     f"seq={rec['seq']} from={dest_ip}:{stream['port']} rtt={rtt_ms:.3f} ms"
                                 )
 
+        series.tick()
         if should_stop_waiting(args, streams, pending, target_total):
             break
 
@@ -2364,6 +2422,7 @@ def run_raw_tcp_client(args, dest_ip):
     selector = selectors.DefaultSelector()
     selector.register(recv_sock, selectors.EVENT_READ)
     print_client_header(args, dest_ip, streams)
+    series = SeriesReporter(args, streams)
     print(f"raw tcp source {source_ip}, source ports {min(source_ports)}..{max(source_ports)}")
 
     try:
@@ -2439,6 +2498,7 @@ def run_raw_tcp_client(args, dest_ip):
                                 f"rtt={rtt_ms:.3f} ms"
                             )
 
+            series.tick()
             if should_stop_waiting(args, streams, pending, target_total):
                 break
 

@@ -272,6 +272,18 @@ for udp, tcp-stream and raw tcp. The header confirms the pinned port; the
 one-way block then tells you whether both directions are still on the fast
 levels. Use the same source port in the real application to ride that path.
 
+To watch a flow's path *over time* — does the fast reverse path survive, and
+when exactly does it flip — add `--series SECONDS` to a long run:
+
+```sh
+./verify_ping.py 10.200.200.1 --protocol tcp-stream --port 50006 -P 1 --src-port 45012 -c 36000 -i 0.05 --series 30
+```
+
+Every window prints `[HH:MM:SS] rtt min/p50 | fwd min | rev min (replies/sent)`;
+the one-way values are the raw wall-clock differences (the final block says
+whether the clocks make them absolute), so a step in `rev min` from one window
+to the next is a path change caught to the window.
+
 Re-running the same TCP 4-tuple within a minute fails with "Cannot assign
 requested address": the previous connection is still in TIME_WAIT. Wait, or
 allow reuse on the client with `sysctl -w net.ipv4.tcp_tw_reuse=1` (safe for
