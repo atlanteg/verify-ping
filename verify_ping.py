@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.6"
+__version__ = "0.12.7"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1075,6 +1075,14 @@ def parse_args():
         help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
     )
     parser.add_argument(
+        "--src-port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="client: fixed source port for stream 1 (stream N uses PORT+N-1), to re-test a "
+        "5-tuple that --hunt found; udp, tcp and tcp-stream",
+    )
+    parser.add_argument(
         "--check-ports",
         action="store_true",
         help="server side: try to bind every port of the --port/-P range over UDP and TCP, "
@@ -1113,6 +1121,15 @@ def validate_args(args):
     args.protocol = protocols[0]
     if args.progress is None:
         args.progress = 0 if (args.hunt and not args.server) else 100
+    if args.src_port is not None:
+        if args.server:
+            raise SystemExit("--src-port is a client option")
+        if args.hunt:
+            raise SystemExit("--src-port pins one flow; it cannot be combined with --hunt")
+        if not (1 <= args.src_port <= 65535) or args.src_port + args.parallel - 1 > 65535:
+            raise SystemExit("--src-port range must stay within 1..65535")
+        if "icmp" in protocols:
+            raise SystemExit("--src-port applies to udp, tcp and tcp-stream, not icmp")
     if args.hunt:
         if args.server:
             raise SystemExit("--hunt is a client option")
@@ -1237,6 +1254,17 @@ def stream_port(args, stream):
     return args.port + (stream["stream"] - 1) % args.parallel
 
 
+def bind_source_port(args, sock, stream):
+    """Bind a client socket to the pinned --src-port for this stream, if any."""
+    if args.src_port is None:
+        return
+    port = args.src_port + stream["stream"] - 1
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError as exc:
+        raise SystemExit(f"cannot bind source port {port}: {exc}{bind_hint(port, exc)}") from exc
+
+
 def port_range(args):
     if args.protocol == "icmp":
         return None
@@ -1259,6 +1287,11 @@ def print_client_header(args, dest_ip, streams):
         f"{stream_count(args)} streams, {target_total} total packets, {args.size} data bytes, "
         f"interval {args.interval}s, ids {ident_range(streams)}"
         + (f", path hunt over {args.parallel} server port(s)" if args.hunt else "")
+        + (
+            f", pinned source port(s) {args.src_port}"
+            + (f"..{args.src_port + stream_count(args) - 1}" if stream_count(args) > 1 else "")
+            if args.src_port is not None else ""
+        )
     )
 
 
@@ -1957,6 +1990,7 @@ def run_udp_client(args, dest_ip):
     for stream in streams:
         port = stream_port(args, stream)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bind_source_port(args, sock, stream)
         try:
             sock.connect((dest_ip, port))
         except OSError as exc:
@@ -2234,6 +2268,9 @@ def connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream):
         port = stream_port(args, stream)
         stream["port"] = port
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if args.src_port is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_source_port(args, sock, stream)
         sock.setblocking(False)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         code = sock.connect_ex((dest_ip, port))
@@ -2295,6 +2332,8 @@ def run_raw_tcp_client(args, dest_ip):
     assign_raw_tcp_source_ports(streams, scatter=bool(args.hunt))
     for stream in streams:
         stream["port"] = stream_port(args, stream)
+        if args.src_port is not None:
+            stream["src_port"] = args.src_port + stream["stream"] - 1
     streams_by_ident = {stream["ident"]: stream for stream in streams}
     source_ports = {stream["src_port"] for stream in streams}
     source_ip = route_source_ip(dest_ip)
@@ -2618,6 +2657,7 @@ def run_udp_reverse_client(args, dest_ip):
     for stream in streams:
         port = stream_port(args, stream)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bind_source_port(args, sock, stream)
         try:
             sock.connect((dest_ip, port))
         except OSError as exc:

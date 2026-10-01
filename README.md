@@ -257,6 +257,21 @@ The final summary names the lowest round trip per protocol and overall, and
 the flows that were fastest forward and reverse — the 5‑tuples to pin a
 latency-sensitive connection to.
 
+### Pinning a flow
+
+Once `--hunt` has named a fast flow, re-test exactly that 5-tuple to see
+whether it stays fast over time — ECMP hashes are stable until the topology
+changes, and this is how you find out:
+
+```sh
+./verify_ping.py 10.200.200.1 --protocol tcp-stream --port 50006 -P 1 --src-port 45012 -c 200 -i 0.05
+```
+
+`--src-port` binds stream 1 to that source port (stream N gets PORT+N−1)
+for udp, tcp-stream and raw tcp. The header confirms the pinned port; the
+one-way block then tells you whether both directions are still on the fast
+levels. Use the same source port in the real application to ride that path.
+
 ### Absolute one-way delay and clock sync
 
 Every packet also carries wall-clock stamps (client send, server receive),
