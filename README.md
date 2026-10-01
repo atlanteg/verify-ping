@@ -272,6 +272,12 @@ for udp, tcp-stream and raw tcp. The header confirms the pinned port; the
 one-way block then tells you whether both directions are still on the fast
 levels. Use the same source port in the real application to ride that path.
 
+Re-running the same TCP 4-tuple within a minute fails with "Cannot assign
+requested address": the previous connection is still in TIME_WAIT. Wait, or
+allow reuse on the client with `sysctl -w net.ipv4.tcp_tw_reuse=1` (safe for
+outgoing connections). When grepping the output, include `failed` so a
+refused run does not pass unnoticed.
+
 ### Absolute one-way delay and clock sync
 
 Every packet also carries wall-clock stamps (client send, server receive),

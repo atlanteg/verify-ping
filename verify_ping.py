@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.7"
+__version__ = "0.12.8"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2252,6 +2252,19 @@ def run_tcp_stream_client(args, dest_ip):
     )
 
 
+def connect_failure_text(args, code):
+    """os.strerror plus the one hint that matters for a pinned source port."""
+    import errno
+
+    text = os.strerror(code)
+    if args.src_port is not None and code == errno.EADDRNOTAVAIL:
+        text += (
+            " -- this 4-tuple is still in TIME_WAIT from a previous run; wait ~60 s, "
+            "or allow reuse with: sysctl -w net.ipv4.tcp_tw_reuse=1"
+        )
+    return text
+
+
 def connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream):
     """Open every stream's TCP connection at once, non-blocking, with one shared deadline.
 
@@ -2275,7 +2288,7 @@ def connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         code = sock.connect_ex((dest_ip, port))
         if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN):
-            failures.append((port, os.strerror(code)))
+            failures.append((port, connect_failure_text(args, code)))
             sock.close()
             continue
         pending[sock] = stream
@@ -2291,7 +2304,7 @@ def connect_tcp_streams(args, dest_ip, streams, selector, socket_to_stream):
             wait.unregister(sock)
             code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if code:
-                failures.append((stream["port"], os.strerror(code)))
+                failures.append((stream["port"], connect_failure_text(args, code)))
                 sock.close()
                 continue
             stream["sock"] = sock
