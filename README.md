@@ -290,6 +290,31 @@ allow reuse on the client with `sysctl -w net.ipv4.tcp_tw_reuse=1` (safe for
 outgoing connections). When grepping the output, include `failed` so a
 refused run does not pass unnoticed.
 
+### Connection roulette (`--roulette`)
+
+When the far side assigns the *return* path per flow rather than by a
+stable hash — a fast reverse path that only a few percent of new
+connections get, and that an idle flow loses after some minutes — no
+source port can be pinned in advance. What works is what a latency-sensitive
+application should do anyway: connect many times, measure, keep the best,
+and never let it go idle. `--roulette N` does exactly that over tcp-stream:
+
+```sh
+./verify_ping.py 10.200.200.1 --roulette 100 --port 50001 -P 8 -c 30 -i 0.2 --keep 1 --hold 1800 --series 30
+```
+
+It opens N connections (over the server's `-P` ports), probes each `-c`
+times, ranks them by reverse one-way delay (absolute when both clocks are
+synced, relative otherwise), prints the top ten with the share of
+connections that landed on the fastest level, keeps the best `--keep`
+connections open, closes the rest, and then holds the kept ones — one probe
+per `-i` on each — printing a `--series` line per window (default 30 s)
+until `--hold` seconds pass or Ctrl+C. A final summary gives min / p50 / max
+per direction over the hold, so a path change on a live connection shows up
+as a step in `rev`. If the kept flow stays fast for as long as you hold it,
+keeping an application connection busy (or on short keepalives) is enough
+to retain the path.
+
 ### Absolute one-way delay and clock sync
 
 Every packet also carries wall-clock stamps (client send, server receive),
