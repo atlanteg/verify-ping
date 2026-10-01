@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2407,7 +2407,7 @@ def run_tcp_stream_roulette(args, dest_ip):
     # connection cannot be changed any more, so the kept flow must be the
     # best round trip, not merely the best return leg.
     answered.sort(key=lambda row: (row["fwd_min"] + row["rev_min"], row["rev_min"]))
-    rev_best = answered[0]["rev_min"]
+    rev_best = min(row["rev_min"] for row in answered)
     fwd_best = min(row["fwd_min"] for row in answered)
     bound, verdict = clock_verdict(args, client_clock, server_clock, answered[0]["rtt_min"])
 
@@ -2424,13 +2424,17 @@ def run_tcp_stream_roulette(args, dest_ip):
     if len(answered) > 10:
         print(f"  ... {len(answered) - 10} more")
     tol = int(args.hunt_tolerance * 1e6)
+    fastest = {}
     for label, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
         groups = group_paths(answered, key, tol)
+        fastest[key] = {row["stream"] for row in groups[0]["rows"]}
         fast = len(groups[0]["rows"])
         print(f"{label} levels: {levels_phrase(groups, tol)}; "
               f"{fast} of {len(answered)} connections ({100.0 * fast / len(answered):.1f}%) on the fastest")
+    # "Fast both ways" means on the fastest gap-separated level in each
+    # direction, the same notion the level lines above use.
     both = [row for row in answered
-            if row["fwd_min"] - fwd_best <= tol and row["rev_min"] - rev_best <= tol]
+            if row["stream"] in fastest["fwd_min"] and row["stream"] in fastest["rev_min"]]
     print(f"fast in both directions: {len(both)} of {len(answered)} connections"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
     print(f"clocks: client {describe_clock(client_clock)}; server "
