@@ -186,6 +186,18 @@ sudo ./verify_ping.py --server --protocol udp,tcp --port 50001 -P 8
 Each protocol runs in its own thread; if one cannot start (raw TCP without
 root, port already in use) the process reports it and exits with status 1.
 
+Before starting a server on a new host, check that the ports are free for
+both transports:
+
+```sh
+./verify_ping.py --check-ports --port 20100 -P 8
+```
+
+It binds each port over UDP and TCP exactly as the servers would, reports
+`free` / `BUSY (reason)` per port and transport, warns if the range overlaps
+the ephemeral range, and releases everything. Exit status 1 if anything is
+busy.
+
 Pick a `--port` range **outside the local ephemeral port range** (Linux:
 `cat /proc/sys/net/ipv4/ip_local_port_range`, usually 32768–60999). A port in
 that range may be taken by an *outgoing* connection at any moment; `bind()`

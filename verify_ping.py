@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.3"
+__version__ = "0.12.4"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1075,6 +1075,12 @@ def parse_args():
         help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
     )
     parser.add_argument(
+        "--check-ports",
+        action="store_true",
+        help="server side: try to bind every port of the --port/-P range over UDP and TCP, "
+        "report which are free, and exit (nothing stays bound)",
+    )
+    parser.add_argument(
         "--wallclock",
         action="store_true",
         help="print absolute one-way delays even when a clock is not reported as synchronised "
@@ -1119,6 +1125,10 @@ def validate_args(args):
         for item in protocols:
             if item not in HUNT_PROTOCOLS:
                 raise SystemExit(f"--hunt supports {', '.join(HUNT_PROTOCOLS)}; not {item}")
+    if args.check_ports:
+        args.server = True
+        if args.port is None:
+            raise SystemExit("--check-ports needs --port (and -P for a range)")
     if not args.server and not args.host:
         raise SystemExit("host is required in client mode")
     if args.reverse and args.server:
@@ -2981,10 +2991,45 @@ def main():
     args = parse_args()
     validate_args(args)
 
+    if args.check_ports:
+        return check_ports(args)
     if args.server:
         if len(args.protocols) > 1:
             return run_multi_server(args)
         return run_server(args)
+
+
+def check_ports(args):
+    """Bind each port of the range over UDP and TCP the way the servers would, then let go."""
+    low, high = ephemeral_port_range()
+    first, last = args.port, args.port + args.parallel - 1
+    span = f"{first}" if first == last else f"{first}..{last}"
+    print(f"verify_ping v{__version__} port check on {args.bind}:{span} "
+          f"(local ephemeral range {low}-{high})")
+    busy = 0
+    for port in range(first, last + 1):
+        results = []
+        for label, kind in (("udp", socket.SOCK_DGRAM), ("tcp", socket.SOCK_STREAM)):
+            sock = socket.socket(socket.AF_INET, kind)
+            try:
+                if kind == socket.SOCK_STREAM:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((args.bind, port))
+                results.append(f"{label} free")
+            except OSError as exc:
+                busy += 1
+                results.append(f"{label} BUSY ({exc.strerror or exc})")
+            finally:
+                sock.close()
+        print(f"  {port}: {', '.join(results)}")
+    if low <= first <= high or low <= last <= high:
+        print(f"warning: the range overlaps the ephemeral port range {low}-{high}; an outgoing "
+              f"connection may grab one of these ports at any time -- prefer ports below {low}")
+    if busy:
+        print(f"{busy} binding(s) busy; see 'ss -Hanp' for who holds them")
+    else:
+        print("all ports free for udp and tcp")
+    return 1 if busy else 0
 
     dest_ip = socket.gethostbyname(args.host)
     if not args.hunt:
