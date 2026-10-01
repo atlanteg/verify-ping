@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.15.1"
+__version__ = "0.15.2"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1663,6 +1663,22 @@ def spread_ns(rows, key):
     return (max(values) - min(values)) if values else 0
 
 
+def near_best_line(rows, label=""):
+    """How many flows are within 0.5 ms of the best in each direction and in both.
+
+    The level lines split a continuous 0.4 ms spread into several levels at
+    the default tolerance; this answers the practical question directly.
+    """
+    band = 500_000
+    fwd_best = min(row["fwd_min"] for row in rows)
+    rev_best = min(row["rev_min"] for row in rows)
+    fwd = {row["stream"] for row in rows if row["fwd_min"] - fwd_best <= band}
+    rev = {row["stream"] for row in rows if row["rev_min"] - rev_best <= band}
+    both = sorted(fwd & rev)
+    return (f"{label}within 0.5 ms of the best: forward {len(fwd)}, reverse {len(rev)}, both {len(both)}"
+            + (f" (flows {both[:10]}{'...' if len(both) > 10 else ''})" if both else "") + f" of {len(rows)}")
+
+
 def flows_phrase(flows, total):
     """'flows [3, 7]' when few, 'N of M flows (single path within tolerance)' when most."""
     if len(flows) > 8 and len(flows) * 2 >= total:
@@ -1780,6 +1796,7 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
             )
         else:
             print("  no flow is fastest both ways (asymmetric ECMP)")
+        print("  " + near_best_line(answered))
         widest = max(widest_level_ns(fwd_groups, tolerance_ns), widest_level_ns(rev_groups, tolerance_ns))
         if widest:
             print(
@@ -2502,6 +2519,7 @@ def run_roulette(args, dest_ip, protocol, label=""):
             if row["stream"] in fastest["fwd_min"] and row["stream"] in fastest["rev_min"]]
     print(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
+    print(near_best_line(answered, label))
     print(f"{label}clocks: client {describe_clock(client_clock)}; server "
           f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
           f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")

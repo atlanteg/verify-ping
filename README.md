@@ -263,7 +263,9 @@ How to read it:
   spread continuously is flagged as queueing rather than distinct paths —
   more probes per flow (`-c`) sharpen the minima.
 - `fastest: flows [...]` — the flows on the fastest level in that direction;
-  the next line says whether any flow is fastest both ways.
+  the next line says whether any flow is fastest both ways. `within 0.5 ms
+  of the best: forward N, reverse M, both K` answers the practical question
+  when a continuous spread has been split into several levels.
 - `lost f/r` — the per-flow loss split (UDP, raw TCP).
 
 The summary names the best round trip per protocol and overall, and the
