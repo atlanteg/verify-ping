@@ -7,10 +7,11 @@ import selectors
 import socket
 import struct
 import sys
+import threading
 import time
 
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -87,6 +88,8 @@ ONEWAY_PROTOCOLS = ("udp", "tcp", "tcp-stream")
 TCP_FRAME_MAX = 1 << 20
 # Collected per-protocol path-hunt tables for the cross-protocol summary.
 HUNT_RESULTS = []
+# Set on Ctrl+C while several roulettes run in threads; hold loops watch it.
+STOP = threading.Event()
 IPV4_HEADER_SIZE = 20
 RAW_TCP_HEADER_SIZE = 20
 RAW_TCP_MAX_PAYLOAD = 65535 - IPV4_HEADER_SIZE - RAW_TCP_HEADER_SIZE
@@ -1075,6 +1078,12 @@ def parse_args():
         help="flows whose minimum RTT differs by at most MS milliseconds count as the same path",
     )
     parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="client: skip the load estimate confirmation prompt (it is also skipped when stdin is not a terminal)",
+    )
+    parser.add_argument(
         "--roulette",
         type=int,
         default=0,
@@ -1139,8 +1148,8 @@ def validate_args(args):
     for item in protocols:
         if item not in PROTOCOLS:
             raise SystemExit(f"unknown protocol {item!r}; choose from {', '.join(PROTOCOLS)}, all")
-    if len(protocols) > 1 and not (args.hunt or args.server):
-        raise SystemExit("several protocols at once are only allowed with --hunt or --server")
+    if len(protocols) > 1 and not (args.hunt or args.server or args.roulette):
+        raise SystemExit("several protocols at once are only allowed with --hunt, --roulette or --server")
     args.protocols = protocols
     args.protocol = protocols[0]
     if args.progress is None:
@@ -1149,15 +1158,17 @@ def validate_args(args):
         if args.server or args.reverse or args.hunt or args.src_port is not None:
             raise SystemExit("--roulette is a client option and cannot be combined with --server, -R, --hunt or --src-port")
         if protocols == ["icmp"] and args.protocol == "icmp":
-            protocols = ["tcp-stream"]
-        if protocols != ["tcp-stream"]:
-            raise SystemExit("--roulette works with --protocol tcp-stream only")
+            protocols = ["udp", "tcp-stream"]  # default: both, side by side
+        if protocols == ["udp", "tcp", "tcp-stream", "icmp"]:
+            protocols = ["udp", "tcp-stream"]  # --protocol all
+        if any(item not in ("udp", "tcp-stream") for item in protocols):
+            raise SystemExit("--roulette works with udp and/or tcp-stream (e.g. --protocol udp,tcp-stream)")
         if args.roulette < 2 or args.roulette > 65535:
             raise SystemExit("--roulette needs between 2 and 65535 connections")
         if args.keep < 1 or args.keep > args.roulette:
             raise SystemExit("--keep must be between 1 and the --roulette count")
         args.protocols = protocols
-        args.protocol = "tcp-stream"
+        args.protocol = protocols[0]
         args.hunt = args.roulette  # stream_count() and port wrap-around reuse the hunt plumbing
     if args.src_port is not None:
         if args.server:
@@ -1846,8 +1857,9 @@ class SeriesReporter:
     consistent, which is what a step change needs.
     """
 
-    def __init__(self, args, streams):
+    def __init__(self, args, streams, label=""):
         self.every = args.series
+        self.label = label
         self.streams = streams
         self.seen = {stream["stream"]: 0 for stream in streams}
         self.next_at = time.monotonic() + self.every if self.every else None
@@ -1872,9 +1884,9 @@ class SeriesReporter:
         self.sent_seen = sent
         stamp = time.strftime("%H:%M:%S")
         if not rtts:
-            print(f"[{stamp}] no replies in this window ({sent_window} sent)", flush=True)
+            print(f"{self.label}[{stamp}] no replies in this window ({sent_window} sent)", flush=True)
             return
-        line = f"[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
+        line = f"{self.label}[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
         if fwd:
             line += f" | fwd min {ms(min(fwd))} | rev min {ms(min(rev))} ms"
         line += f"  ({len(rtts)}/{sent_window} replies)"
@@ -2058,19 +2070,7 @@ def run_icmp_client(args, dest_ip):
     return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
 
 
-def run_udp_client(args, dest_ip):
-    streams, started = build_streams(args)
-    streams_by_ident = {stream["ident"]: stream for stream in streams}
-    target_total = args.count * stream_count(args)
-    pending = {}
-    completed = {}
-    bad = []
-    duplicates = 0
-    unexpected = 0
-    verified_total = 0
-
-    selector = selectors.DefaultSelector()
-    socket_to_stream = {}
+def open_udp_streams(args, dest_ip, streams, selector, socket_to_stream):
     for stream in streams:
         port = stream_port(args, stream)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2085,97 +2085,135 @@ def run_udp_client(args, dest_ip):
         stream["src_port"] = sock.getsockname()[1]
         socket_to_stream[sock.fileno()] = stream
         selector.register(sock, selectors.EVENT_READ)
+    return streams
 
-    print_client_header(args, dest_ip, streams)
-    series = SeriesReporter(args, streams)
 
-    while sum(stream["sent"] for stream in streams) < target_total or pending:
+def udp_ctrl_fns(selector, socket_to_stream):
+    """send_request / recv_replies closures for in-band control over connected UDP sockets."""
+
+    def send_request(carrier, data):
+        if carrier["sock"] and not carrier["closed"]:
+            carrier["sock"].send(data)
+
+    def recv_replies(wait):
+        replies = []
+        end = time.monotonic() + wait
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            events = selector.select(remaining)
+            if not events:
+                break
+            for key, _mask in events:
+                while True:
+                    try:
+                        data = key.fileobj.recv(UDP_MAX_PAYLOAD)
+                    except OSError:
+                        break
+                    if data.startswith(CTRL_MAGIC):
+                        replies.append(data)
+        return replies
+
+    return send_request, recv_replies
+
+
+def udp_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, series, deadline=None):
+    """Drive the UDP probe loop; same contract as tcp_stream_probe."""
+    streams_by_ident = {stream["ident"]: stream for stream in streams}
+    pending = state["pending"]
+    hold = count is None
+    limit = (1 << 62) if hold else count
+    target_total = limit * len(streams)
+
+    def live_streams():
+        return [stream for stream in streams if stream["sock"] and not stream["closed"]]
+
+    while True:
         now = time.monotonic()
-        for stream in streams:
-            while stream["sent"] < args.count and now >= stream["next_send"]:
+        if hold and (STOP.is_set() or (deadline is not None and now >= deadline)):
+            break
+        if not hold and not (sum(stream["sent"] for stream in streams) < target_total or pending):
+            break
+        for stream in live_streams():
+            while stream["sent"] < limit and now >= stream["next_send"]:
                 seq, payload = make_stream_payload(args, stream)
                 try:
                     sent = send_connected_with_retry(stream["sock"], payload, args.timeout)
                 except OSError as exc:
+                    if hold:
+                        print(f"stream {stream['stream']} ({stream['src_port']}->{stream['port']}): send failed: {exc}")
+                        stream["closed"] = True
+                        break
                     raise SystemExit(f"udp send to {dest_ip}:{stream['port']} failed: {exc}") from exc
                 if not sent:
-                    raise SystemExit(
-                        f"udp send to {dest_ip}:{stream['port']} timed out waiting for socket buffer"
-                    )
+                    raise SystemExit(f"udp send to {dest_ip}:{stream['port']} timed out waiting for socket buffer")
                 record_pending(pending, stream, seq, payload, args.interval)
                 now = time.monotonic()
+                if hold:
+                    break
 
-        timeout = min(next_send_wait(streams, args.count, time.monotonic(), args.timeout), args.timeout, 0.2)
+        timeout = min(next_send_wait(live_streams(), limit, time.monotonic(), args.timeout), args.timeout, 0.2)
         if timeout == 0 and pending:
             timeout = 0.001
 
-        events = selector.select(timeout)
-        for key, _mask in events:
+        for key, _mask in selector.select(timeout):
             stream = socket_to_stream[key.fileobj.fileno()]
             while True:
                 try:
                     payload = key.fileobj.recv(UDP_MAX_PAYLOAD)
-                except BlockingIOError:
-                    break
-                except OSError:
+                except (BlockingIOError, OSError):
                     break
                 if payload.startswith(CTRL_MAGIC):
                     continue
-
                 result = verify_payload(
-                    payload,
-                    f"{dest_ip}:{stream['port']}",
-                    streams_by_ident,
-                    pending,
-                    completed,
-                    bad,
+                    payload, f"{dest_ip}:{stream['port']}", streams_by_ident,
+                    pending, state["completed"], state["bad"],
                 )
                 if result == "duplicate":
-                    duplicates += 1
+                    state["duplicates"] += 1
                 elif result == "unexpected":
-                    unexpected += 1
+                    state["unexpected"] += 1
                 elif result != "bad":
-                    verified_total += 1
+                    state["verified"] += 1
                     _state, rec, rtt_ms = result
-                    if args.verbose or (args.progress and verified_total % args.progress == 0):
+                    if not hold and (args.verbose or (args.progress and state["verified"] % args.progress == 0)):
                         print(
-                            f"ok={verified_total}/{target_total} stream={rec['stream']} "
+                            f"ok={state['verified']}/{target_total} stream={rec['stream']} "
                             f"seq={rec['seq']} from={dest_ip}:{stream['port']} rtt={rtt_ms:.3f} ms"
                         )
 
+        if hold:
+            cutoff = time.monotonic() - args.timeout
+            for key in [key for key, rec in pending.items() if rec["sent_at"] < cutoff]:
+                del pending[key]
+                state["hold_lost"] += 1
         series.tick()
-        if should_stop_waiting(args, streams, pending, target_total):
+        if not hold and should_stop_waiting(args, streams, pending, target_total):
             break
+        if hold and not live_streams():
+            print("every held flow is gone; stopping")
+            break
+
+
+def run_udp_client(args, dest_ip):
+    streams, started = build_streams(args)
+    selector = selectors.DefaultSelector()
+    socket_to_stream = {}
+    streams = open_udp_streams(args, dest_ip, streams, selector, socket_to_stream)
+
+    print_client_header(args, dest_ip, streams)
+    series = SeriesReporter(args, streams)
+    state = new_probe_state()
+    udp_probe(args, dest_ip, streams, selector, socket_to_stream, state, args.count, series)
 
     arrival_logs = None
     server_clock = None
-    if not args.no_directional and not verified_total:
+    if not args.no_directional and not state["verified"]:
         print("no verified reply on any stream; skipping the in-band fetch (nothing can come back either)")
     elif not args.no_directional:
         # Pull the arrival log over the same connected sockets the test used.
-        def send_request(stream, data):
-            stream["sock"].send(data)
-
-        def recv_replies(wait):
-            replies = []
-            end = time.monotonic() + wait
-            while True:
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    break
-                events = selector.select(remaining)
-                if not events:
-                    break
-                for key, _mask in events:
-                    while True:
-                        try:
-                            data = key.fileobj.recv(UDP_MAX_PAYLOAD)
-                        except OSError:
-                            break
-                        if data.startswith(CTRL_MAGIC):
-                            replies.append(data)
-            return replies
-
+        send_request, recv_replies = udp_ctrl_fns(selector, socket_to_stream)
         arrival_logs = fetch_arrival_logs(args, streams, send_request, recv_replies)
         server_clock = fetch_server_clock(args, streams, send_request, recv_replies)
 
@@ -2183,7 +2221,8 @@ def run_udp_client(args, dest_ip):
         stream["sock"].close()
 
     return print_client_stats(
-        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, arrival_logs, server_clock
+        args, dest_ip, started, streams, state["pending"], state["bad"], state["duplicates"],
+        state["unexpected"], arrival_logs, server_clock,
     )
 
 
@@ -2247,7 +2286,7 @@ def tcp_stream_probe(args, dest_ip, streams, selector, socket_to_stream, state, 
 
     while True:
         now = time.monotonic()
-        if hold and deadline is not None and now >= deadline:
+        if hold and (STOP.is_set() or (deadline is not None and now >= deadline)):
             break
         if not hold and not (sum(stream["sent"] for stream in streams) < target_total or pending):
             break
@@ -2375,26 +2414,49 @@ def run_tcp_stream_client(args, dest_ip):
     )
 
 
-def run_tcp_stream_roulette(args, dest_ip):
-    """Open N connections, keep the K with the fastest reverse path, hold them alive.
+ROULETTE_TRANSPORTS = {
+    "udp": {"name": "udp", "open": open_udp_streams, "probe": udp_probe, "ctrl": udp_ctrl_fns},
+    "tcp-stream": {"name": "tcp", "open": open_tcp_streams_or_exit, "probe": tcp_stream_probe,
+                   "ctrl": tcp_stream_ctrl_fns},
+}
+
+
+def close_stream(selector, stream):
+    sock = stream["sock"]
+    if sock and not stream["closed"]:
+        try:
+            selector.unregister(sock)
+        except (KeyError, ValueError):
+            pass
+        sock.close()
+        stream["closed"] = True
+
+
+def run_roulette(args, dest_ip, protocol, label=""):
+    """Open N flows, keep the K with the best round trip, hold them alive.
 
     What a latency-sensitive application should do when the far side assigns
     the return path per flow: connect many, measure, keep the best, never let
-    it go idle. The hold phase doubles as the test of how long the fast path
-    survives on a live connection.
+    it go idle. For UDP a "flow" is the connected socket, kept alive by the
+    probes themselves. The hold phase doubles as the test of how long the
+    fast path survives on a live flow.
     """
+    transport = ROULETTE_TRANSPORTS[protocol]
+    args = argparse.Namespace(**vars(args))
+    args.protocol = protocol
     streams, started = build_streams(args)
     selector = selectors.DefaultSelector()
     socket_to_stream = {}
-    streams = open_tcp_streams_or_exit(args, dest_ip, streams, selector, socket_to_stream)
+    streams = transport["open"](args, dest_ip, streams, selector, socket_to_stream)
     print_client_header(args, dest_ip, streams)
-    print(f"roulette: probing {len(streams)} connections with {args.count} probes each, keeping the best {args.keep}")
+    print(f"{label}roulette: probing {len(streams)} {transport['name']} flows with {args.count} probes each, "
+          f"keeping the best {args.keep}")
 
     state = new_probe_state()
     quiet = SeriesReporter(argparse.Namespace(series=0), streams)
-    tcp_stream_probe(args, dest_ip, streams, selector, socket_to_stream, state, args.count, quiet)
+    transport["probe"](args, dest_ip, streams, selector, socket_to_stream, state, args.count, quiet)
 
-    send_request, recv_replies = tcp_stream_ctrl_fns(selector, socket_to_stream)
+    send_request, recv_replies = transport["ctrl"](selector, socket_to_stream)
     live = [stream for stream in streams if stream["sock"] and not stream["closed"]]
     server_clock = fetch_server_clock(args, live, send_request, recv_replies) if live else None
     client_clock = clock_status()
@@ -2402,62 +2464,58 @@ def run_tcp_stream_roulette(args, dest_ip):
     rows = [hunt_flow_stats(stream, None) for stream in live]
     answered = [row for row in rows if row["rtt_min"] is not None and row["rev_min"] is not None]
     if not answered:
-        raise SystemExit("roulette: no connection got a verified reply; nothing to choose from")
+        raise SystemExit(f"{label}roulette: no {transport['name']} flow got a verified reply; nothing to choose from")
     # Rank by the sum of per-direction minima: the forward path of an open
-    # connection cannot be changed any more, so the kept flow must be the
-    # best round trip, not merely the best return leg.
+    # flow cannot be changed any more, so the kept flow must be the best
+    # round trip, not merely the best return leg.
     answered.sort(key=lambda row: (row["fwd_min"] + row["rev_min"], row["rev_min"]))
     rev_best = min(row["rev_min"] for row in answered)
     fwd_best = min(row["fwd_min"] for row in answered)
     bound, verdict = clock_verdict(args, client_clock, server_clock, answered[0]["rtt_min"])
 
     print()
-    print(f"--- roulette: {len(answered)} connections ranked by forward + reverse minima ---")
-    print(f"{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
+    print(f"{label}--- roulette {transport['name']}: {len(answered)} flows ranked by forward + reverse minima ---")
+    print(f"{label}{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
           + (f" {'rev_abs':>9} {'fwd_abs':>9}" if bound is not None else ""))
     for index, row in enumerate(answered[:10], 1):
-        line = (f"{index:>4} {row['stream']:>4} {flow_label('tcp-stream', row):<14} {ms(row['rtt_min']):>9} "
+        line = (f"{label}{index:>4} {row['stream']:>4} {flow_label(protocol, row):<14} {ms(row['rtt_min']):>9} "
                 f"{'+' + ms(row['rev_min'] - rev_best):>9} {'+' + ms(row['fwd_min'] - fwd_best):>9}")
         if bound is not None:
             line += f" {ms(row['rev_abs_min']):>9} {ms(row['fwd_abs_min']):>9}"
         print(line)
     if len(answered) > 10:
-        print(f"  ... {len(answered) - 10} more")
+        print(f"{label}  ... {len(answered) - 10} more")
     tol = int(args.hunt_tolerance * 1e6)
     fastest = {}
-    for label, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
+    for name, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
         groups = group_paths(answered, key, tol)
         fastest[key] = {row["stream"] for row in groups[0]["rows"]}
         fast = len(groups[0]["rows"])
-        print(f"{label} levels: {levels_phrase(groups, tol)}; "
-              f"{fast} of {len(answered)} connections ({100.0 * fast / len(answered):.1f}%) on the fastest")
-    # "Fast both ways" means on the fastest gap-separated level in each
-    # direction, the same notion the level lines above use.
+        print(f"{label}{name} levels: {levels_phrase(groups, tol)}; "
+              f"{fast} of {len(answered)} flows ({100.0 * fast / len(answered):.1f}%) on the fastest")
     both = [row for row in answered
             if row["stream"] in fastest["fwd_min"] and row["stream"] in fastest["rev_min"]]
-    print(f"fast in both directions: {len(both)} of {len(answered)} connections"
+    print(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
-    print(f"clocks: client {describe_clock(client_clock)}; server "
+    print(f"{label}clocks: client {describe_clock(client_clock)}; server "
           f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
           f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")
 
     chosen = [row["stream"] for row in answered[:args.keep]]
     kept = [stream for stream in streams if stream["stream"] in chosen]
     for stream in streams:
-        if stream["stream"] not in chosen and stream["sock"] and not stream["closed"]:
-            selector.unregister(stream["sock"])
-            stream["sock"].close()
-            stream["closed"] = True
-    print()
+        if stream["stream"] not in chosen:
+            close_stream(selector, stream)
     kept_text = ", ".join(f"flow {s['stream']} ({s['src_port']}->{s['port']})" for s in kept)
-    print(f"keeping {kept_text}; closed {len(streams) - len(kept)} others")
+    print()
+    print(f"{label}keeping {kept_text}; closed {len(streams) - len(kept)} others")
     hold_text = f"for {args.hold:g}s" if args.hold else "until Ctrl+C"
     series_every = args.series or 30.0
-    print(f"holding {hold_text}, one probe every {args.interval:g}s per connection, window {series_every:g}s")
+    print(f"{label}holding {hold_text}, one probe every {args.interval:g}s per flow, window {series_every:g}s")
 
     hold_args = argparse.Namespace(**vars(args))
     hold_args.series = series_every
-    series = SeriesReporter(hold_args, kept)
+    series = SeriesReporter(hold_args, kept, label)
     marks = {stream["stream"]: len(stream["lat"]) for stream in kept}
     now = time.monotonic()
     for stream in kept:
@@ -2465,22 +2523,22 @@ def run_tcp_stream_roulette(args, dest_ip):
     deadline = now + args.hold if args.hold else None
     hold_started = now
     try:
-        tcp_stream_probe(args, dest_ip, kept, selector, socket_to_stream, state, None, series, deadline)
+        transport["probe"](args, dest_ip, kept, selector, socket_to_stream, state, None, series, deadline)
     except KeyboardInterrupt:
         print("\nstopped")
 
     held = time.monotonic() - hold_started
     print()
-    print(f"--- roulette hold summary ({held:.0f}s) ---")
+    print(f"{label}--- roulette {transport['name']} hold summary ({held:.0f}s) ---")
     for stream in kept:
         lat = stream["lat"][marks[stream["stream"]]:]
         if not lat:
-            print(f"flow {stream['stream']}: no replies during hold")
+            print(f"{label}flow {stream['stream']}: no replies during hold")
             continue
         rtts = [item[0] for item in lat]
         fwd = [item[3] for item in lat if item[3] is not None]
         rev = [item[4] for item in lat if item[4] is not None]
-        line = (f"flow {stream['stream']} ({stream['src_port']}->{stream['port']}): {len(lat)} replies, "
+        line = (f"{label}flow {stream['stream']} ({stream['src_port']}->{stream['port']}): {len(lat)} replies, "
                 f"rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} max {ms(max(rtts))} ms")
         if fwd:
             line += (f" | fwd min {ms(min(fwd))} p50 {ms(percentile(fwd, 0.5))} | rev min {ms(min(rev))} "
@@ -2489,12 +2547,44 @@ def run_tcp_stream_roulette(args, dest_ip):
                 line += f" (absolute, {verdict})"
         print(line)
     if state["hold_lost"]:
-        print(f"probes written off as lost during hold: {state['hold_lost']}")
+        print(f"{label}probes written off as lost during hold: {state['hold_lost']}")
     for stream in kept:
-        if stream["sock"] and not stream["closed"]:
-            selector.unregister(stream["sock"])
-            stream["sock"].close()
+        close_stream(selector, stream)
     return 0
+
+
+def run_roulettes(args, dest_ip):
+    """One roulette per protocol, concurrently in threads when there are several."""
+    if len(args.protocols) == 1:
+        return run_roulette(args, dest_ip, args.protocols[0])
+
+    codes = {}
+
+    def runner(protocol):
+        label = f"[{ROULETTE_TRANSPORTS[protocol]['name']}] "
+        try:
+            codes[protocol] = run_roulette(args, dest_ip, protocol, label)
+        except SystemExit as exc:
+            print(f"{label}{exc}")
+            codes[protocol] = 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"{label}crashed: {exc!r}")
+            codes[protocol] = 1
+
+    threads = [threading.Thread(target=runner, args=(protocol,), daemon=True, name=protocol)
+               for protocol in args.protocols]
+    for thread in threads:
+        thread.start()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            for thread in threads:
+                thread.join(0.5)
+    except KeyboardInterrupt:
+        print("\nstopping all roulettes")
+        STOP.set()
+        for thread in threads:
+            thread.join(10)
+    return max(codes.values()) if codes else 1
 
 
 def connect_failure_text(args, code):
@@ -3331,6 +3421,77 @@ def check_ports(args):
     return 1 if busy else 0
 
 
+WIRE_OVERHEAD = {
+    # bytes added to the payload on the wire: L2 (14) + IPv4 (20) + transport
+    "icmp": 14 + 20 + 8,
+    "udp": 14 + 20 + 8,
+    "tcp": 14 + 20 + 20,
+    "tcp-stream": 14 + 20 + 20 + TCP_FRAME_HEADER_SIZE,
+}
+
+
+def fmt_rate(bps):
+    for unit, scale in (("Gbit/s", 1e9), ("Mbit/s", 1e6), ("kbit/s", 1e3)):
+        if bps >= scale:
+            return f"{bps / scale:.2f} {unit}"
+    return f"{bps:.0f} bit/s"
+
+
+def load_estimate(args):
+    """[(label, flows, pps, bps)] per phase of the run, each per direction (the echo mirrors it)."""
+    phases = []
+    if args.roulette:
+        for protocol in args.protocols:
+            name = ROULETTE_TRANSPORTS[protocol]["name"]
+            wire = (args.size + WIRE_OVERHEAD[protocol]) * 8
+            pps = args.roulette / args.interval
+            phases.append((f"{name} roulette, probing {args.roulette} flows", args.roulette, pps, pps * wire))
+            pps = args.keep / args.interval
+            phases.append((f"{name} roulette, holding {args.keep} flow(s)", args.keep, pps, pps * wire))
+        return phases
+    flows = stream_count(args)
+    for protocol in args.protocols:
+        wire = (args.size + WIRE_OVERHEAD[protocol]) * 8
+        pps = flows / args.interval if args.interval > 0 else float("inf")
+        phases.append((f"{protocol}, {flows} flow(s)", flows, pps, pps * wire))
+    return phases
+
+
+def confirm_load(args):
+    """Print what the run will put on the wire and wait for Enter (unless -y or no tty)."""
+    phases = load_estimate(args)
+    concurrent = bool(args.roulette) and len(args.protocols) > 1
+    print(f"verify_ping v{__version__} load estimate (per direction; the echo adds the same the other way):")
+    for label, flows, pps, bps in phases:
+        print(f"  {label:<44} {pps:>9.1f} pkt/s  {fmt_rate(bps):>14}")
+    if concurrent:
+        # udp and tcp roulettes run at the same time: probing phases overlap, so do the holds
+        probe = [item for item in phases if "probing" in item[0]]
+        hold = [item for item in phases if "holding" in item[0]]
+        for name, group in (("all roulettes probing at once", probe), ("all roulettes holding at once", hold)):
+            pps = sum(item[2] for item in group)
+            bps = sum(item[3] for item in group)
+            print(f"  {name:<44} {pps:>9.1f} pkt/s  {fmt_rate(bps):>14}")
+    elif len(phases) > 1:
+        peak = max(phases, key=lambda item: item[3])
+        print(f"  {'peak (phases run one after another)':<44} {peak[2]:>9.1f} pkt/s  {fmt_rate(peak[3]):>14}")
+    duration = args.count * args.interval + args.timeout
+    if args.roulette:
+        print(f"  probing takes ~{duration:.0f}s, then holding "
+              + (f"{args.hold:g}s" if args.hold else "until Ctrl+C"))
+    else:
+        print(f"  each protocol runs ~{duration:.0f}s")
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        print("  (stdin is not a terminal: proceeding without confirmation)")
+        return
+    try:
+        input("Proceed? [Enter = yes, Ctrl+C = abort] ")
+    except (KeyboardInterrupt, EOFError):
+        raise SystemExit("\naborted before sending anything")
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -3344,8 +3505,9 @@ def main():
 
 
     dest_ip = socket.gethostbyname(args.host)
+    confirm_load(args)
     if args.roulette:
-        return run_tcp_stream_roulette(args, dest_ip)
+        return run_roulettes(args, dest_ip)
     if not args.hunt:
         return run_client(args, dest_ip)
 

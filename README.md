@@ -297,13 +297,17 @@ stable hash — a fast reverse path that only a few percent of new
 connections get, and that an idle flow loses after some minutes — no
 source port can be pinned in advance. What works is what a latency-sensitive
 application should do anyway: connect many times, measure, keep the best,
-and never let it go idle. `--roulette N` does exactly that over tcp-stream:
+and never let it go idle. `--roulette N` does exactly that, for TCP
+(`tcp-stream`) and UDP side by side — by default both run concurrently,
+each with its own N flows, their lines prefixed `[tcp]` / `[udp]`; pass
+`--protocol udp` or `--protocol tcp-stream` for one of them. A UDP "flow" is
+the connected socket, kept alive by the probes themselves:
 
 ```sh
 ./verify_ping.py 10.200.200.1 --roulette 100 --port 50001 -P 8 -c 30 -i 0.2 --keep 1 --hold 1800 --series 30
 ```
 
-It opens N connections (over the server's `-P` ports), probes each `-c`
+It opens N flows (over the server's `-P` ports), probes each `-c`
 times, ranks them by the sum of the forward and reverse minima — the
 forward path of an open connection cannot be changed any more, so the kept
 flow has to be the best round trip, not merely the best return leg —
@@ -410,6 +414,27 @@ Wait longer for late replies after the last packet:
 ```sh
 sudo ./verify_ping.py 10.200.200.1 -i 0.08 -c 3000 -s 1200 -W 5
 ```
+
+### Load estimate and confirmation
+
+Before a client sends anything it prints what the run will put on the wire
+— packets/s and bit/s per direction (the echo mirrors it the other way),
+including L2/IP/transport overhead, per protocol and per phase, with the
+peak (sequential phases) or the sum (concurrent roulettes) — and waits for
+Enter:
+
+```text
+verify_ping v0.15.0 load estimate (per direction; the echo adds the same the other way):
+  udp, 32 flow(s)                                  640.0 pkt/s     2.78 Mbit/s
+  tcp-stream, 32 flow(s)                           640.0 pkt/s     2.86 Mbit/s
+  peak (phases run one after another)              640.0 pkt/s     2.86 Mbit/s
+  each protocol runs ~6s
+Proceed? [Enter = yes, Ctrl+C = abort]
+```
+
+Ctrl+C there aborts without a single packet sent. `-y` / `--yes` skips the
+question for scripts; when stdin is not a terminal it is skipped as well,
+with a note.
 
 ## Directional statistics
 
