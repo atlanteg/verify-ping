@@ -10,7 +10,7 @@ import sys
 import time
 
 
-__version__ = "0.12.8"
+__version__ = "0.12.9"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2257,7 +2257,7 @@ def connect_failure_text(args, code):
     import errno
 
     text = os.strerror(code)
-    if args.src_port is not None and code == errno.EADDRNOTAVAIL:
+    if args.src_port is not None and code in (errno.EADDRNOTAVAIL, errno.EADDRINUSE):
         text += (
             " -- this 4-tuple is still in TIME_WAIT from a previous run; wait ~60 s, "
             "or allow reuse with: sysctl -w net.ipv4.tcp_tw_reuse=1"
