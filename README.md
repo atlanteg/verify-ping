@@ -176,7 +176,7 @@ One server process can serve every protocol at once — UDP and TCP are
 separate port spaces, so the same `--port` range works for both:
 
 ```sh
-sudo ./verify_ping.py --server --protocol all --port 50001 -P 8     # udp + raw tcp + tcp-stream
+sudo ./verify_ping.py --server --protocol all --port 50001 -P 8     # udp + raw tcp + tcp-stream + icmp observer
 sudo ./verify_ping.py --server --protocol udp,tcp --port 50001 -P 8
 ```
 
@@ -188,8 +188,7 @@ Pick a `--port` range **outside the local ephemeral port range** (Linux:
 that range may be taken by an *outgoing* connection at any moment; `bind()`
 then fails with "Address already in use" although `netstat -l` shows nothing.
 The server says so when it happens. Ports like `20100–20107` are safe.
-`icmp` in a server list is ignored with a note, since the kernel answers
-ICMP echo itself. On the client, `--protocol all` means `udp,tcp,icmp`.
+On the client, `--protocol all` means `udp,tcp,icmp`.
 
 Each protocol prints a table sorted by minimum RTT:
 
@@ -287,15 +286,27 @@ The older application-level TCP stream echo mode is still available as
 TCP stream mode uses a normal TCP connection and frames each payload internally
 before echoing it.
 
-While a UDP or raw TCP server is receiving test traffic it prints one line per
-second, and one more when the burst ends, so the far end shows whether packets
-arrive at all (handy when debugging a firewall):
+The server log says, per protocol, when a client's test starts, how much is
+arriving each second, and what the run totalled, so the far end shows whether
+packets arrive at all (handy when debugging a firewall) and several servers in
+one process stay tellable apart:
 
 ```text
-[14:02:11] rx=50 pkt/s streams=4 clients=1 total=50
-[14:02:12] rx=50 pkt/s streams=4 clients=1 total=100
-[14:02:13] idle, total received 100
+[14:02:10] udp: test traffic from 10.0.0.7 started
+[14:02:11] udp: rx=50 pkt/s streams=4 clients=1 total=50
+[14:02:12] udp: rx=50 pkt/s streams=4 clients=1 total=100
+[14:02:13] udp: finished, 100 packets over 4 stream(s) from 10.0.0.7
+[14:02:20] tcp (raw): test traffic from 10.0.0.7 started
+...
+[14:02:31] tcp-stream: connection from 10.0.0.7:41822 on port 20100
+[14:02:33] tcp-stream: 10.0.0.7:41822 closed, 58.6KB echoed
+[14:02:40] icmp (observed; kernel answers): test traffic from 10.0.0.7 started
 ```
+
+ICMP echo is answered by the kernel, so an `icmp` server only *observes*:
+with root it watches echo requests that carry verify_ping payloads and logs
+them like the others; without root it says so and the ICMP test still works.
+`--protocol all` on the server includes it.
 
 Pass `--progress 0` to the server to silence it. On the client `--progress N`
 prints a line every N verified replies (default 100).

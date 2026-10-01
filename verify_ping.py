@@ -358,24 +358,34 @@ class ArrivalLog:
 
 
 class ServerProgress:
-    """Once-a-second receive summary on the server so the far end shows life.
+    """Per-protocol receive log on the server so the far end shows life.
 
-    Prints only while packets are arriving, plus one line when a burst ends,
-    so an idle server does not spam its log.
+    Announces when test traffic from a client starts, prints one line per
+    second while packets arrive, and one line when the run ends with its
+    totals, so an idle server does not spam its log and several servers in
+    one process stay tellable apart.
     """
 
-    def __init__(self, enabled):
+    def __init__(self, enabled, label):
         self.enabled = enabled
+        self.label = label
         self.next_tick = time.monotonic() + 1.0
         self.window = 0
-        self.total = 0
+        self.run_total = 0
         self.streams = set()
         self.clients = set()
         self.active = False
 
     def add(self, nonce, client_ip):
+        if not self.active:
+            self.active = True
+            self.run_total = 0
+            self.streams.clear()
+            self.clients.clear()
+            if self.enabled:
+                print(f"[{time.strftime('%H:%M:%S')}] {self.label}: test traffic from {client_ip} started", flush=True)
         self.window += 1
-        self.total += 1
+        self.run_total += 1
         self.streams.add(nonce)
         self.clients.add(client_ip)
 
@@ -388,17 +398,18 @@ class ServerProgress:
         self.next_tick = now + 1.0
         stamp = time.strftime("%H:%M:%S")
         if self.window:
-            self.active = True
             print(
-                f"[{stamp}] rx={self.window} pkt/s streams={len(self.streams)} "
-                f"clients={len(self.clients)} total={self.total}",
+                f"[{stamp}] {self.label}: rx={self.window} pkt/s streams={len(self.streams)} "
+                f"clients={len(self.clients)} total={self.run_total}",
                 flush=True,
             )
         elif self.active:
             self.active = False
-            print(f"[{stamp}] idle, total received {self.total}", flush=True)
-            self.streams.clear()
-            self.clients.clear()
+            print(
+                f"[{stamp}] {self.label}: finished, {self.run_total} packets over "
+                f"{len(self.streams)} stream(s) from {', '.join(sorted(self.clients))}",
+                flush=True,
+            )
         self.window = 0
 
 
@@ -940,8 +951,9 @@ def parse_args():
         "--server",
         "--listen",
         action="store_true",
-        help="run UDP/TCP echo server instead of a client; --protocol may list several "
-        "(udp,tcp,tcp-stream or all) to serve them all from one process on the same ports",
+        help="run the echo server instead of a client; --protocol may list several "
+        "(udp,tcp,tcp-stream,icmp or all) to serve them all from one process on the same ports; "
+        "icmp only observes (the kernel answers echo) and needs root",
     )
     parser.add_argument(
         "--bind",
@@ -1015,15 +1027,12 @@ def parse_args():
 def validate_args(args):
     protocols = [item.strip() for item in args.protocol.split(",") if item.strip()]
     if protocols == ["all"]:
-        protocols = ["udp", "tcp", "tcp-stream"] if args.server else ["udp", "tcp", "icmp"]
+        protocols = ["udp", "tcp", "tcp-stream", "icmp"] if args.server else ["udp", "tcp", "icmp"]
     if not protocols:
         raise SystemExit("protocol is required")
     for item in protocols:
         if item not in PROTOCOLS:
             raise SystemExit(f"unknown protocol {item!r}; choose from {', '.join(PROTOCOLS)}, all")
-    if args.server and len(protocols) > 1 and "icmp" in protocols:
-        print("icmp: echo replies are answered by the kernel, nothing to run; serving the rest")
-        protocols = [item for item in protocols if item != "icmp"]
     if len(protocols) > 1 and not (args.hunt or args.server):
         raise SystemExit("several protocols at once are only allowed with --hunt or --server")
     args.protocols = protocols
@@ -1042,8 +1051,6 @@ def validate_args(args):
         for item in protocols:
             if item not in HUNT_PROTOCOLS:
                 raise SystemExit(f"--hunt supports {', '.join(HUNT_PROTOCOLS)}; not {item}")
-    if args.server and args.protocol == "icmp":
-        raise SystemExit("ICMP echo replies are provided by the OS; --server is only for UDP/TCP")
     if not args.server and not args.host:
         raise SystemExit("host is required in client mode")
     if args.reverse and args.server:
@@ -2240,7 +2247,7 @@ def run_raw_tcp_server(args):
     first_port = args.port
     last_port = args.port + args.parallel - 1
     arrival_log = ArrivalLog()
-    progress = ServerProgress(args.progress > 0)
+    progress = ServerProgress(args.progress > 0, "tcp (raw)")
 
     def raw_tcp_chunk(nonce, kind, index):
         if kind == KIND_CLOCK:
@@ -2318,7 +2325,7 @@ def run_udp_server(args):
 
     arrival_log = ArrivalLog()
     sessions = {}  # -R runs we are probing, keyed by client nonce
-    progress = ServerProgress(args.progress > 0)
+    progress = ServerProgress(args.progress > 0, "udp")
     actual_host = sockets[0].getsockname()[0]
     print(f"verify_ping udp echo server listening on {actual_host}:{port_range(args)}", flush=True)
     print("arrival logs for directional stats are served in-band on the same ports", flush=True)
@@ -2427,7 +2434,7 @@ def run_udp_reverse_client(args, dest_ip):
     )
 
     arrival_log = ArrivalLog()
-    progress = ServerProgress(args.progress > 0)
+    progress = ServerProgress(args.progress > 0, "udp -R echo")
     acked = set()
     summaries = {}
     handshake_deadline = started + max(10.0, args.timeout * 3)
@@ -2669,15 +2676,38 @@ def run_tcp_stream_server(args):
 
     actual_host = listeners[0].getsockname()[0]
     print(f"verify_ping tcp-stream echo server listening on {actual_host}:{port_range(args)}", flush=True)
+    peers = {}
+    echoed = {}
+    chatty = args.progress > 0
+
+    def close_conn(conn, fileno, why):
+        selector.unregister(conn)
+        buffers.pop(fileno, None)
+        conn.close()
+        peer = peers.pop(fileno, None)
+        total = echoed.pop(fileno, 0)
+        if chatty and peer:
+            print(
+                f"[{time.strftime('%H:%M:%S')}] tcp-stream: {peer} {why}, {fmt_bytes(total)} echoed",
+                flush=True,
+            )
 
     try:
         while True:
             for key, mask in selector.select(1.0):
                 if key.data and key.data.get("listener"):
-                    conn, _addr = key.fileobj.accept()
+                    conn, addr = key.fileobj.accept()
                     conn.setblocking(False)
                     buffers[conn.fileno()] = bytearray()
+                    peers[conn.fileno()] = f"{addr[0]}:{addr[1]}"
+                    echoed[conn.fileno()] = 0
                     selector.register(conn, selectors.EVENT_READ, {"listener": False, "fileno": conn.fileno()})
+                    if chatty:
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] tcp-stream: connection from {addr[0]}:{addr[1]} "
+                            f"on port {key.fileobj.getsockname()[1]}",
+                            flush=True,
+                        )
                     continue
 
                 conn = key.fileobj
@@ -2688,10 +2718,9 @@ def run_tcp_stream_server(args):
                     except ConnectionResetError:
                         data = b""
                     if not data:
-                        selector.unregister(conn)
-                        buffers.pop(fileno, None)
-                        conn.close()
+                        close_conn(conn, fileno, "closed")
                         continue
+                    echoed[fileno] = echoed.get(fileno, 0) + len(data)
                     buffers[fileno].extend(data)
                     selector.modify(
                         conn,
@@ -2703,9 +2732,7 @@ def run_tcp_stream_server(args):
                     try:
                         sent = conn.send(buffers[fileno])
                     except (BrokenPipeError, ConnectionResetError):
-                        selector.unregister(conn)
-                        buffers.pop(fileno, None)
-                        conn.close()
+                        close_conn(conn, fileno, "reset")
                         continue
                     del buffers[fileno][:sent]
                     if not buffers[fileno]:
@@ -2772,11 +2799,62 @@ def bind_hint(port, exc):
     )
 
 
+def run_icmp_observer(args):
+    """Watch ICMP echo requests that carry verify_ping payloads.
+
+    The kernel answers ICMP echo by itself, so there is nothing to serve;
+    this only makes an ICMP test visible in the server log like the others.
+    Needs root for the raw socket; without it the test still works, it just
+    is not shown here.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except PermissionError:
+        print(
+            "icmp: observer needs root for a raw socket; the kernel answers echo anyway, "
+            "so icmp tests still work -- they just will not show up in this log",
+            flush=True,
+        )
+        return 0
+    sock.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(sock, selectors.EVENT_READ)
+    progress = ServerProgress(args.progress > 0, "icmp (observed; kernel answers)")
+    print("verify_ping icmp observer: showing echo requests that carry verify_ping payloads", flush=True)
+
+    try:
+        while True:
+            for _key, _mask in selector.select(1.0):
+                while True:
+                    try:
+                        packet, src = sock.recvfrom(65535)
+                    except BlockingIOError:
+                        break
+                    parsed = parse_icmp_reply(packet)
+                    if not parsed:
+                        continue
+                    typ, _code, _ident, _seq, payload = parsed
+                    if typ != ICMP_ECHO_REQUEST or not payload.startswith(MAGIC):
+                        continue
+                    meta = parse_payload(payload)
+                    if meta:
+                        progress.add(meta["nonce"], src[0])
+            progress.tick()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        selector.unregister(sock)
+        sock.close()
+    return 0
+
+
 def run_server(args):
     if args.protocol == "udp":
         return run_udp_server(args)
     if args.protocol == "tcp":
         return run_raw_tcp_server(args)
+    if args.protocol == "icmp":
+        return run_icmp_observer(args)
     return run_tcp_stream_server(args)
 
 
