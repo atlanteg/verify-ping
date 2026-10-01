@@ -188,7 +188,7 @@ Pick a `--port` range **outside the local ephemeral port range** (Linux:
 that range may be taken by an *outgoing* connection at any moment; `bind()`
 then fails with "Address already in use" although `netstat -l` shows nothing.
 The server says so when it happens. Ports like `20100–20107` are safe.
-On the client, `--protocol all` means `udp,tcp,icmp`.
+On the client, `--protocol all` means `udp,tcp,tcp-stream,icmp`.
 
 Each protocol prints a table sorted by minimum RTT:
 
@@ -284,7 +284,13 @@ The older application-level TCP stream echo mode is still available as
 ```
 
 TCP stream mode uses a normal TCP connection and frames each payload internally
-before echoing it.
+before echoing it. Since 0.12.0 the server stamps every frame like UDP, so
+`tcp-stream` yields round-trip *and* one-way delays per connection and takes
+part in `--hunt` (each connection is one flow with its own source port). It
+is the mode to use from behind a stateful NAT that drops raw segments. Loss
+and reordering are not reported for it: TCP retransmits and reorders
+underneath. `TCP_NODELAY` is set on both ends so Nagle does not skew the
+timings.
 
 The server log says, per protocol, when a client's test starts, how much is
 arriving each second, and what the run totalled, so the far end shows whether

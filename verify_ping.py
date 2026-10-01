@@ -76,7 +76,10 @@ CTRL_ROUND_WAIT = 0.25      # seconds to collect replies per round
 CONTROL_PROTOCOLS = ("udp", "tcp")
 REVERSE_PROTOCOLS = ("udp",)
 PROTOCOLS = ("icmp", "udp", "tcp", "tcp-stream")
-HUNT_PROTOCOLS = ("icmp", "udp", "tcp")
+HUNT_PROTOCOLS = ("icmp", "udp", "tcp", "tcp-stream")
+# Protocols whose echo side stamps replies, i.e. that yield one-way delays.
+ONEWAY_PROTOCOLS = ("udp", "tcp", "tcp-stream")
+TCP_FRAME_MAX = 1 << 20
 # Collected per-protocol path-hunt tables for the cross-protocol summary.
 HUNT_RESULTS = []
 IPV4_HEADER_SIZE = 20
@@ -329,6 +332,28 @@ def count_reordered(keys):
         else:
             run_max = key
     return reordered
+
+
+def frame(payload):
+    return struct.pack("!I", len(payload)) + payload
+
+
+def pop_frames(buf):
+    """Yield complete length-prefixed payloads from a bytearray, consuming them.
+
+    Returns None mid-way if a frame announces an absurd length, which means
+    the peer is not speaking our framing; the caller should drop it.
+    """
+    out = []
+    while len(buf) >= TCP_FRAME_HEADER_SIZE:
+        length = struct.unpack("!I", buf[:TCP_FRAME_HEADER_SIZE])[0]
+        if length > TCP_FRAME_MAX:
+            return None
+        if len(buf) < TCP_FRAME_HEADER_SIZE + length:
+            break
+        out.append(bytes(buf[TCP_FRAME_HEADER_SIZE:TCP_FRAME_HEADER_SIZE + length]))
+        del buf[:TCP_FRAME_HEADER_SIZE + length]
+    return out
 
 
 def chunk_of(entries, kind, index):
@@ -1027,7 +1052,7 @@ def parse_args():
 def validate_args(args):
     protocols = [item.strip() for item in args.protocol.split(",") if item.strip()]
     if protocols == ["all"]:
-        protocols = ["udp", "tcp", "tcp-stream", "icmp"] if args.server else ["udp", "tcp", "icmp"]
+        protocols = ["udp", "tcp", "tcp-stream", "icmp"]
     if not protocols:
         raise SystemExit("protocol is required")
     for item in protocols:
@@ -1236,11 +1261,11 @@ def print_client_stats(
     elif args.protocol == "icmp":
         print("directional stats: n/a for icmp (echo comes from the remote OS, no arrival log)")
     elif args.protocol == "tcp-stream":
-        print("directional stats: n/a for tcp-stream (TCP masks loss and reordering)")
+        print("directional loss/reorder: n/a for tcp-stream (TCP retransmits and reorders for you)")
 
     if args.hunt:
         print_hunt_report(args, streams, arrival_logs, server_clock)
-    elif args.protocol in CONTROL_PROTOCOLS and not args.no_directional:
+    elif args.protocol in ONEWAY_PROTOCOLS and not args.no_directional:
         print_oneway_stats(args, streams, server_clock)
 
     return 0 if sent_total == verified_total and not pending and not bad else 1
@@ -1625,14 +1650,14 @@ def print_hunt_summary(dest_ip):
     for result in HUNT_RESULTS:
         protocol = result["protocol"]
         if not result["groups"]:
-            print(f"{protocol:<5} no replies")
+            print(f"{protocol:<10} no replies")
             continue
         top = result["groups"][0]
         row = top["rows"][0]
         worst = max(item["rtt_min"] for group in result["groups"] for item in group["rows"])
         solid = sum(1 for group in result["groups"] if len(group["rows"]) > 1)
         print(
-            f"{protocol:<5} rtt {ms(row['rtt_min'])}..{ms(worst)} ms, {solid} path level(s); "
+            f"{protocol:<10} rtt {ms(row['rtt_min'])}..{ms(worst)} ms, {solid} path level(s); "
             f"best flow {row['stream']} ({flow_label(protocol, row)})"
         )
         if "fwd" in result["best"]:
@@ -1976,6 +2001,7 @@ def run_tcp_stream_client(args, dest_ip):
             sock = socket.create_connection((dest_ip, port), timeout=args.timeout)
         except OSError as exc:
             raise SystemExit(f"tcp connect to {dest_ip}:{port} failed: {exc}") from exc
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setblocking(False)
         stream["sock"] = sock
         stream["port"] = port
@@ -1990,8 +2016,7 @@ def run_tcp_stream_client(args, dest_ip):
         for stream in streams:
             while stream["sent"] < args.count and now >= stream["next_send"]:
                 seq, payload = make_stream_payload(args, stream)
-                frame = struct.pack("!I", len(payload)) + payload
-                stream["out"].extend(frame)
+                stream["out"].extend(frame(payload))
                 record_pending(pending, stream, seq, payload, args.interval)
                 selector.modify(stream["sock"], selectors.EVENT_READ | selectors.EVENT_WRITE)
                 now = time.monotonic()
@@ -2026,15 +2051,9 @@ def run_tcp_stream_client(args, dest_ip):
                     continue
                 if chunk:
                     stream["in"].extend(chunk)
-                    while len(stream["in"]) >= TCP_FRAME_HEADER_SIZE:
-                        length = struct.unpack("!I", stream["in"][:TCP_FRAME_HEADER_SIZE])[0]
-                        if len(stream["in"]) < TCP_FRAME_HEADER_SIZE + length:
-                            break
-                        payload = bytes(
-                            stream["in"][TCP_FRAME_HEADER_SIZE:TCP_FRAME_HEADER_SIZE + length]
-                        )
-                        del stream["in"][:TCP_FRAME_HEADER_SIZE + length]
-
+                    for payload in pop_frames(stream["in"]) or []:
+                        if payload.startswith(CTRL_MAGIC):
+                            continue
                         result = verify_payload(
                             payload,
                             f"{dest_ip}:{stream['port']}",
@@ -2059,13 +2078,57 @@ def run_tcp_stream_client(args, dest_ip):
         if should_stop_waiting(args, streams, pending, target_total):
             break
 
+    server_clock = None
+    if not args.no_directional and verified_total:
+        # Ask the server for its clock status over the first live connection,
+        # framed like everything else on the stream.
+        def send_request(carrier, data):
+            sock = carrier["sock"]
+            if sock and not carrier["closed"]:
+                sock.sendall(frame(data))
+
+        def recv_replies(wait):
+            replies = []
+            end = time.monotonic() + wait
+            while True:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                events = selector.select(remaining)
+                if not events:
+                    break
+                for key, mask in events:
+                    if not mask & selectors.EVENT_READ:
+                        continue
+                    stream = socket_to_stream[key.fileobj.fileno()]
+                    try:
+                        chunk = key.fileobj.recv(65535)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        stream["closed"] = True
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    stream["in"].extend(chunk)
+                    for payload in pop_frames(stream["in"]) or []:
+                        if payload.startswith(CTRL_MAGIC):
+                            replies.append(payload)
+            return replies
+
+        live = [stream for stream in streams if stream["sock"] and not stream["closed"]]
+        if live:
+            server_clock = fetch_server_clock(args, live, send_request, recv_replies)
+
     for stream in streams:
         sock = stream["sock"]
         if sock and not stream["closed"]:
             selector.unregister(sock)
             sock.close()
 
-    return print_client_stats(args, dest_ip, started, streams, pending, bad, duplicates, unexpected)
+    return print_client_stats(
+        args, dest_ip, started, streams, pending, bad, duplicates, unexpected, None, server_clock
+    )
 
 
 def assign_raw_tcp_source_ports(streams, scatter=False):
@@ -2676,13 +2739,25 @@ def run_tcp_stream_server(args):
 
     actual_host = listeners[0].getsockname()[0]
     print(f"verify_ping tcp-stream echo server listening on {actual_host}:{port_range(args)}", flush=True)
+    print("frames are stamped like udp, so tcp-stream yields one-way delays too", flush=True)
     peers = {}
+    peer_ips = {}
     echoed = {}
+    inbufs = {}
     chatty = args.progress > 0
+    arrival_log = ArrivalLog()
+    progress = ServerProgress(chatty, "tcp-stream")
+
+    def stream_chunk(nonce, kind, index):
+        if kind == KIND_CLOCK:
+            return chunk_of([clock_record()], kind, index)
+        return arrival_log.chunk(nonce, kind, index)
 
     def close_conn(conn, fileno, why):
         selector.unregister(conn)
         buffers.pop(fileno, None)
+        inbufs.pop(fileno, None)
+        peer_ips.pop(fileno, None)
         conn.close()
         peer = peers.pop(fileno, None)
         total = echoed.pop(fileno, 0)
@@ -2698,8 +2773,11 @@ def run_tcp_stream_server(args):
                 if key.data and key.data.get("listener"):
                     conn, addr = key.fileobj.accept()
                     conn.setblocking(False)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     buffers[conn.fileno()] = bytearray()
+                    inbufs[conn.fileno()] = bytearray()
                     peers[conn.fileno()] = f"{addr[0]}:{addr[1]}"
+                    peer_ips[conn.fileno()] = addr[0]
                     echoed[conn.fileno()] = 0
                     selector.register(conn, selectors.EVENT_READ, {"listener": False, "fileno": conn.fileno()})
                     if chatty:
@@ -2721,7 +2799,23 @@ def run_tcp_stream_server(args):
                         close_conn(conn, fileno, "closed")
                         continue
                     echoed[fileno] = echoed.get(fileno, 0) + len(data)
-                    buffers[fileno].extend(data)
+                    inbufs[fileno].extend(data)
+                    payloads = pop_frames(inbufs[fileno])
+                    if payloads is None:
+                        close_conn(conn, fileno, "dropped (not verify_ping framing)")
+                        continue
+                    for payload in payloads:
+                        reply = serve_ctrl_request(stream_chunk, payload)
+                        if reply is None:
+                            meta = parse_payload(payload)
+                            if meta:
+                                rseq = arrival_log.record(meta["nonce"], meta["seq"])
+                                payload = stamp_payload(payload, rseq)
+                                progress.add(meta["nonce"], peer_ips.get(fileno, "?"))
+                            reply = payload
+                        buffers[fileno].extend(frame(reply))
+                    if not buffers[fileno]:
+                        continue
                     selector.modify(
                         conn,
                         selectors.EVENT_READ | selectors.EVENT_WRITE,
@@ -2741,6 +2835,7 @@ def run_tcp_stream_server(args):
                             selectors.EVENT_READ,
                             {"listener": False, "fileno": fileno},
                         )
+            progress.tick()
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
