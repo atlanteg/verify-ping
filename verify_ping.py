@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.15.2"
+__version__ = "0.16.0"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1123,6 +1123,14 @@ def parse_args():
                       help="flows to keep per protocol in --roulette (default 1)")
     hunt.add_argument("--hold", type=float, default=0, metavar="SEC",
                       help="how long --roulette holds the kept flows (default: until Ctrl+C)")
+    hunt.add_argument("--reroll", action="store_true",
+                      help="--roulette: when the held flow degrades, open a new batch of N, swap to a better "
+                           "one if found, log the event; summary gives rerolls, time on the fast path, mean rtt")
+    hunt.add_argument("--reroll-threshold", type=float, default=2.0, metavar="MS",
+                      help="a window whose rtt_min exceeds the held flow's baseline by more than MS ms counts as "
+                           "degraded (default 2.0)")
+    hunt.add_argument("--reroll-windows", type=int, default=2, metavar="N",
+                      help="degraded windows in a row that trigger a reroll (default 2)")
 
     out = parser.add_argument_group("output")
     out.add_argument("--series", type=float, default=0, metavar="SEC",
@@ -1172,6 +1180,10 @@ def validate_args(args):
             raise SystemExit("--roulette needs between 2 and 65535 connections")
         if args.keep < 1 or args.keep > args.roulette:
             raise SystemExit("--keep must be between 1 and the --roulette count")
+        if args.reroll and args.keep != 1:
+            raise SystemExit("--reroll holds exactly one flow per protocol; use --keep 1")
+        if args.reroll_threshold <= 0 or args.reroll_windows < 1:
+            raise SystemExit("--reroll-threshold must be positive and --reroll-windows at least 1")
         args.protocols = protocols
         args.protocol = protocols[0]
         args.hunt = args.roulette  # stream_count() and port wrap-around reuse the hunt plumbing
@@ -1886,6 +1898,9 @@ class SeriesReporter:
         self.seen = {stream["stream"]: 0 for stream in streams}
         self.next_at = time.monotonic() + self.every if self.every else None
         self.sent_seen = 0
+        self.windows = 0
+        self.last = None
+        self.history = []  # (wall time, rtt_min_ns, rtt_p50_ns, replies) per window
 
     def tick(self):
         if not self.next_at or time.monotonic() < self.next_at:
@@ -1905,9 +1920,13 @@ class SeriesReporter:
         sent_window = sent - self.sent_seen
         self.sent_seen = sent
         stamp = time.strftime("%H:%M:%S")
+        self.windows += 1
         if not rtts:
+            self.last = None
             print(f"{self.label}[{stamp}] no replies in this window ({sent_window} sent)", flush=True)
             return
+        self.last = {"rtt_min": min(rtts), "rtt_p50": percentile(rtts, 0.5), "n": len(rtts)}
+        self.history.append((time.time(), self.last["rtt_min"], self.last["rtt_p50"], len(rtts)))
         line = f"{self.label}[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
         if fwd:
             line += f" | fwd min {ms(min(fwd))} | rev min {ms(min(rev))} ms"
@@ -2140,7 +2159,7 @@ def udp_ctrl_fns(selector, socket_to_stream):
     return send_request, recv_replies
 
 
-def udp_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, series, deadline=None):
+def udp_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, series, deadline=None, stop_check=None):
     """Drive the UDP probe loop; same contract as tcp_stream_probe."""
     streams_by_ident = {stream["ident"]: stream for stream in streams}
     pending = state["pending"]
@@ -2211,6 +2230,8 @@ def udp_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, 
                 del pending[key]
                 state["hold_lost"] += 1
         series.tick()
+        if hold and stop_check is not None and stop_check():
+            break
         if not hold and should_stop_waiting(args, streams, pending, target_total):
             break
         if hold and not live_streams():
@@ -2288,7 +2309,7 @@ def tcp_stream_ctrl_fns(selector, socket_to_stream):
     return send_request, recv_replies
 
 
-def tcp_stream_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, series, deadline=None):
+def tcp_stream_probe(args, dest_ip, streams, selector, socket_to_stream, state, count, series, deadline=None, stop_check=None):
     """Drive the tcp-stream probe loop.
 
     count: probes per stream, or None to keep probing until `deadline`
@@ -2378,6 +2399,8 @@ def tcp_stream_probe(args, dest_ip, streams, selector, socket_to_stream, state, 
                 del pending[key]
                 state["hold_lost"] += 1
         series.tick()
+        if hold and stop_check is not None and stop_check():
+            break
         if not hold and should_stop_waiting(args, streams, pending, target_total):
             break
         if hold and not live_streams():
@@ -2454,25 +2477,16 @@ def close_stream(selector, stream):
         stream["closed"] = True
 
 
-def run_roulette(args, dest_ip, protocol, label=""):
-    """Open N flows, keep the K with the best round trip, hold them alive.
-
-    What a latency-sensitive application should do when the far side assigns
-    the return path per flow: connect many, measure, keep the best, never let
-    it go idle. For UDP a "flow" is the connected socket, kept alive by the
-    probes themselves. The hold phase doubles as the test of how long the
-    fast path survives on a live flow.
-    """
-    transport = ROULETTE_TRANSPORTS[protocol]
-    args = argparse.Namespace(**vars(args))
-    args.protocol = protocol
-    streams, started = build_streams(args)
+def roulette_round(args, dest_ip, transport, protocol, label, round_no):
+    """Open N flows, probe, rank. Returns a dict with the ranked rows and the live sockets."""
+    streams, _started = build_streams(args)
     selector = selectors.DefaultSelector()
     socket_to_stream = {}
     streams = transport["open"](args, dest_ip, streams, selector, socket_to_stream)
-    print_client_header(args, dest_ip, streams)
-    print(f"{label}roulette: probing {len(streams)} {transport['name']} flows with {args.count} probes each, "
-          f"keeping the best {args.keep}")
+    if round_no == 0:
+        print_client_header(args, dest_ip, streams)
+    print(f"{label}roulette{' reroll #' + str(round_no) if round_no else ''}: probing {len(streams)} "
+          f"{transport['name']} flows with {args.count} probes each, keeping the best {args.keep}")
 
     state = new_probe_state()
     quiet = SeriesReporter(argparse.Namespace(series=0), streams)
@@ -2486,7 +2500,9 @@ def run_roulette(args, dest_ip, protocol, label=""):
     rows = [hunt_flow_stats(stream, None) for stream in live]
     answered = [row for row in rows if row["rtt_min"] is not None and row["rev_min"] is not None]
     if not answered:
-        raise SystemExit(f"{label}roulette: no {transport['name']} flow got a verified reply; nothing to choose from")
+        for stream in streams:
+            close_stream(selector, stream)
+        return None
     # Rank by the sum of per-direction minima: the forward path of an open
     # flow cannot be changed any more, so the kept flow must be the best
     # round trip, not merely the best return leg.
@@ -2494,20 +2510,21 @@ def run_roulette(args, dest_ip, protocol, label=""):
     rev_best = min(row["rev_min"] for row in answered)
     fwd_best = min(row["fwd_min"] for row in answered)
     bound, verdict = clock_verdict(args, client_clock, server_clock, answered[0]["rtt_min"])
-
-    print()
-    print(f"{label}--- roulette {transport['name']}: {len(answered)} flows ranked by forward + reverse minima ---")
-    print(f"{label}{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
-          + (f" {'rev_abs':>9} {'fwd_abs':>9}" if bound is not None else ""))
-    for index, row in enumerate(answered[:10], 1):
-        line = (f"{label}{index:>4} {row['stream']:>4} {flow_label(protocol, row):<14} {ms(row['rtt_min']):>9} "
-                f"{'+' + ms(row['rev_min'] - rev_best):>9} {'+' + ms(row['fwd_min'] - fwd_best):>9}")
-        if bound is not None:
-            line += f" {ms(row['rev_abs_min']):>9} {ms(row['fwd_abs_min']):>9}"
-        print(line)
-    if len(answered) > 10:
-        print(f"{label}  ... {len(answered) - 10} more")
     tol = int(args.hunt_tolerance * 1e6)
+
+    if round_no == 0:
+        print()
+        print(f"{label}--- roulette {transport['name']}: {len(answered)} flows ranked by forward + reverse minima ---")
+        print(f"{label}{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
+              + (f" {'rev_abs':>9} {'fwd_abs':>9}" if bound is not None else ""))
+        for index, row in enumerate(answered[:10], 1):
+            line = (f"{label}{index:>4} {row['stream']:>4} {flow_label(protocol, row):<14} {ms(row['rtt_min']):>9} "
+                    f"{'+' + ms(row['rev_min'] - rev_best):>9} {'+' + ms(row['fwd_min'] - fwd_best):>9}")
+            if bound is not None:
+                line += f" {ms(row['rev_abs_min']):>9} {ms(row['fwd_abs_min']):>9}"
+            print(line)
+        if len(answered) > 10:
+            print(f"{label}  ... {len(answered) - 10} more")
     fastest = {}
     for name, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
         groups = group_paths(answered, key, tol)
@@ -2520,60 +2537,179 @@ def run_roulette(args, dest_ip, protocol, label=""):
     print(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
     print(near_best_line(answered, label))
-    print(f"{label}clocks: client {describe_clock(client_clock)}; server "
-          f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
-          f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")
+    if round_no == 0:
+        print(f"{label}clocks: client {describe_clock(client_clock)}; server "
+              f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
+              f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")
+    return {
+        "streams": streams, "answered": answered, "state": state, "selector": selector,
+        "socket_to_stream": socket_to_stream, "bound": bound, "verdict": verdict,
+    }
 
-    chosen = [row["stream"] for row in answered[:args.keep]]
-    kept = [stream for stream in streams if stream["stream"] in chosen]
-    for stream in streams:
-        if stream["stream"] not in chosen:
-            close_stream(selector, stream)
-    kept_text = ", ".join(f"flow {s['stream']} ({s['src_port']}->{s['port']})" for s in kept)
-    print()
-    print(f"{label}keeping {kept_text}; closed {len(streams) - len(kept)} others")
-    hold_text = f"for {args.hold:g}s" if args.hold else "until Ctrl+C"
+
+def run_roulette(args, dest_ip, protocol, label=""):
+    """Open N flows, keep the K with the best round trip, hold them alive.
+
+    What a latency-sensitive application should do when the far side assigns
+    the return path per flow: connect many, measure, keep the best, never let
+    it go idle. For UDP a "flow" is the connected socket, kept alive by the
+    probes themselves. The hold phase doubles as the test of how long the
+    fast path survives on a live flow; with --reroll a degraded flow is
+    replaced by a fresh batch's best, and the summary says how often that
+    was needed and what it bought.
+    """
+    transport = ROULETTE_TRANSPORTS[protocol]
+    args = argparse.Namespace(**vars(args))
+    args.protocol = protocol
     series_every = args.series or 30.0
-    print(f"{label}holding {hold_text}, one probe every {args.interval:g}s per flow, window {series_every:g}s")
-
     hold_args = argparse.Namespace(**vars(args))
     hold_args.series = series_every
-    series = SeriesReporter(hold_args, kept, label)
-    marks = {stream["stream"]: len(stream["lat"]) for stream in kept}
-    now = time.monotonic()
-    for stream in kept:
-        stream["next_send"] = now
-    deadline = now + args.hold if args.hold else None
-    hold_started = now
+
+    first = roulette_round(args, dest_ip, transport, protocol, label, 0)
+    if first is None:
+        raise SystemExit(f"{label}roulette: no {transport['name']} flow got a verified reply; nothing to choose from")
+    bound, verdict = first["bound"], first["verdict"]
+
+    def pick(round_result, how_many):
+        chosen = [row["stream"] for row in round_result["answered"][:how_many]]
+        kept = [stream for stream in round_result["streams"] if stream["stream"] in chosen]
+        for stream in round_result["streams"]:
+            if stream["stream"] not in chosen:
+                close_stream(round_result["selector"], stream)
+        return kept
+
+    kept = pick(first, args.keep)
+    current = first  # the round whose sockets/state the held flows live in
+    baseline_ns = min(row["rtt_min"] for row in first["answered"][:args.keep])
+    kept_text = ", ".join(f"flow {s['stream']} ({s['src_port']}->{s['port']})" for s in kept)
+    print()
+    print(f"{label}keeping {kept_text}; closed {len(first['streams']) - len(kept)} others")
+    hold_text = f"for {args.hold:g}s" if args.hold else "until Ctrl+C"
+    print(f"{label}holding {hold_text}, one probe every {args.interval:g}s per flow, window {series_every:g}s"
+          + (f"; reroll when rtt_min exceeds {ms(baseline_ns)} + {args.reroll_threshold:g} ms for "
+             f"{args.reroll_windows} window(s)" if args.reroll else ""))
+
+    hold_started = time.monotonic()
+    deadline = hold_started + args.hold if args.hold else None
+    segments = []   # (flows text, start, end, series history, lat slices)
+    rerolls = []    # (wall time, old text, old rtt_min, new text or None, new rtt_min or None)
+    round_no = 0
+    best_seen_ns = baseline_ns
+
     try:
-        transport["probe"](args, dest_ip, kept, selector, socket_to_stream, state, None, series, deadline)
+        while True:
+            series = SeriesReporter(hold_args, kept, label)
+            marks = {stream["stream"]: len(stream["lat"]) for stream in kept}
+            now = time.monotonic()
+            for stream in kept:
+                stream["next_send"] = now
+            degraded = {"count": 0, "seen": 0}
+
+            def degraded_now():
+                if series.windows == degraded["seen"] or series.last is None:
+                    return False
+                degraded["seen"] = series.windows
+                if series.last["rtt_min"] - baseline_ns > args.reroll_threshold * 1e6:
+                    degraded["count"] += 1
+                else:
+                    degraded["count"] = 0
+                return degraded["count"] >= args.reroll_windows
+
+            seg_start = time.monotonic()
+            transport["probe"](args, dest_ip, kept, current["selector"], current["socket_to_stream"],
+                               current["state"], None, series, deadline,
+                               degraded_now if args.reroll else None)
+            seg_end = time.monotonic()
+            segments.append((kept_text, seg_start, seg_end, list(series.history),
+                             [(stream, stream["lat"][marks[stream["stream"]]:]) for stream in kept]))
+
+            finished = STOP.is_set() or (deadline is not None and seg_end >= deadline)
+            if finished or not args.reroll or not degraded_now_result(degraded, args):
+                break
+
+            stamp = time.strftime("%H:%M:%S")
+            old_min = series.last["rtt_min"] if series.last else None
+            print(f"{label}[{stamp}] {kept_text} degraded: window rtt_min {ms(old_min) if old_min else '?'} ms vs "
+                  f"baseline {ms(baseline_ns)} ms; rerolling")
+            round_no += 1
+            candidate = roulette_round(args, dest_ip, transport, protocol, label, round_no)
+            if candidate is None:
+                print(f"{label}reroll #{round_no}: no candidate answered; keeping {kept_text}")
+                rerolls.append((time.time(), kept_text, old_min, None, None))
+                continue
+            best = candidate["answered"][0]
+            improvement = (old_min or baseline_ns) - best["rtt_min"]
+            if improvement >= 0.5e6:
+                new_kept = pick(candidate, args.keep)
+                new_text = ", ".join(f"flow {s['stream']} ({s['src_port']}->{s['port']})" for s in new_kept)
+                print(f"{label}reroll #{round_no}: switching to {new_text} rtt_min {ms(best['rtt_min'])} ms "
+                      f"(better by {ms(improvement)} ms); closing {kept_text}")
+                for stream in kept:
+                    close_stream(current["selector"], stream)
+                rerolls.append((time.time(), kept_text, old_min, new_text, best["rtt_min"]))
+                kept, kept_text, current = new_kept, new_text, candidate
+                baseline_ns = best["rtt_min"]
+                best_seen_ns = min(best_seen_ns, baseline_ns)
+            else:
+                print(f"{label}reroll #{round_no}: best candidate rtt_min {ms(best['rtt_min'])} ms is not better "
+                      f"than the current {ms(old_min) if old_min else '?'} ms; keeping {kept_text}")
+                for stream in candidate["streams"]:
+                    close_stream(candidate["selector"], stream)
+                rerolls.append((time.time(), kept_text, old_min, None, best["rtt_min"]))
+                baseline_ns = old_min or baseline_ns  # accept the new normal so we do not reroll every window
     except KeyboardInterrupt:
         print("\nstopped")
 
     held = time.monotonic() - hold_started
     print()
-    print(f"{label}--- roulette {transport['name']} hold summary ({held:.0f}s) ---")
+    print(f"{label}--- roulette {transport['name']} hold summary ({held:.0f}s"
+          + (f", {len(rerolls)} reroll(s)" if args.reroll else "") + ") ---")
+    all_rtts, fast_time, windowed_time = [], 0.0, 0.0
+    for text, start, end, history, slices in segments:
+        for stream, lat in slices:
+            if not lat:
+                print(f"{label}{text}: no replies during its {end - start:.0f}s")
+                continue
+            rtts = [item[0] for item in lat]
+            all_rtts.extend(rtts)
+            fwd = [item[3] for item in lat if item[3] is not None]
+            rev = [item[4] for item in lat if item[4] is not None]
+            line = (f"{label}flow {stream['stream']} ({stream['src_port']}->{stream['port']}): held {end - start:.0f}s, "
+                    f"{len(lat)} replies, rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} max {ms(max(rtts))} ms")
+            if fwd:
+                line += (f" | fwd min {ms(min(fwd))} p50 {ms(percentile(fwd, 0.5))} | rev min {ms(min(rev))} "
+                         f"p50 {ms(percentile(rev, 0.5))} max {ms(max(rev))} ms")
+                if bound is not None:
+                    line += f" (absolute, {verdict})"
+            print(line)
+        for _wall, rtt_min_ns, _p50, _n in history:
+            windowed_time += series_every
+            if rtt_min_ns - best_seen_ns <= args.reroll_threshold * 1e6:
+                fast_time += series_every
+    if args.reroll:
+        for wall, old_text, old_min, new_text, new_min in rerolls:
+            stamp = time.strftime("%H:%M:%S", time.localtime(wall))
+            if new_text:
+                print(f"{label}  {stamp} reroll: {old_text} ({ms(old_min) if old_min else '?'} ms) -> "
+                      f"{new_text} ({ms(new_min)} ms)")
+            else:
+                print(f"{label}  {stamp} reroll: {old_text} ({ms(old_min) if old_min else '?'} ms) -> "
+                      f"kept (best candidate {ms(new_min) if new_min else 'none'} ms)")
+        if windowed_time:
+            print(f"{label}time within {args.reroll_threshold:g} ms of the best rtt_min seen ({ms(best_seen_ns)} ms): "
+                  f"{100.0 * fast_time / windowed_time:.0f}% of {windowed_time:.0f}s")
+    if all_rtts:
+        print(f"{label}over the whole hold: rtt mean {ms(sum(all_rtts) // len(all_rtts))} p50 "
+              f"{ms(percentile(all_rtts, 0.5))} ms over {len(all_rtts)} replies")
+    if current["state"]["hold_lost"]:
+        print(f"{label}probes written off as lost during hold: {current['state']['hold_lost']}")
     for stream in kept:
-        lat = stream["lat"][marks[stream["stream"]]:]
-        if not lat:
-            print(f"{label}flow {stream['stream']}: no replies during hold")
-            continue
-        rtts = [item[0] for item in lat]
-        fwd = [item[3] for item in lat if item[3] is not None]
-        rev = [item[4] for item in lat if item[4] is not None]
-        line = (f"{label}flow {stream['stream']} ({stream['src_port']}->{stream['port']}): {len(lat)} replies, "
-                f"rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} max {ms(max(rtts))} ms")
-        if fwd:
-            line += (f" | fwd min {ms(min(fwd))} p50 {ms(percentile(fwd, 0.5))} | rev min {ms(min(rev))} "
-                     f"p50 {ms(percentile(rev, 0.5))} max {ms(max(rev))} ms")
-            if bound is not None:
-                line += f" (absolute, {verdict})"
-        print(line)
-    if state["hold_lost"]:
-        print(f"{label}probes written off as lost during hold: {state['hold_lost']}")
-    for stream in kept:
-        close_stream(selector, stream)
+        close_stream(current["selector"], stream)
     return 0
+
+
+def degraded_now_result(degraded, args):
+    return degraded["count"] >= args.reroll_windows
 
 
 def run_roulettes(args, dest_ip):

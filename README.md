@@ -298,6 +298,24 @@ sudo python3 verify_ping.py 10.0.0.1 --roulette 100 --port 20100 -P 8 -c 30 -i 0
   direction over the hold. A path change on a live flow shows as a step in
   `rev`.
 
+**Automatic re-roll.** The return path can change on a *live* flow (seen in
+practice after minutes of continuous traffic), so keeping a flow busy does
+not guarantee it stays fast. With `--reroll` the hold phase watches each
+window's `rtt_min` against the held flow's baseline; after
+`--reroll-windows` (2) consecutive windows more than `--reroll-threshold`
+(2 ms) above it, a fresh batch of N flows is opened and ranked, the held
+flow is swapped for the best candidate if that is at least 0.5 ms better
+(otherwise the candidates are closed and the new level becomes the
+baseline), and the event is logged. The summary then lists every held
+segment, each re-roll with before/after, the share of time spent within the
+threshold of the best `rtt_min` seen, and the mean/p50 round trip over the
+whole hold — i.e. what a "connect many, keep the best, re-roll on
+degradation" strategy actually achieves on this path.
+
+```sh
+sudo python3 verify_ping.py 10.0.0.1 --roulette 100 --port 20100 -P 8 -c 30 -i 0.2 -s 500 --hold 7200 --series 30 --reroll
+```
+
 ```text
 [tcp] --- roulette tcp: 100 flows ranked by forward + reverse minima ---
 [tcp] rank flow src->dst         rtt_min   rev_rel   fwd_rel   rev_abs   fwd_abs
@@ -435,6 +453,9 @@ loss resolution is 1/probes.
 | `--hunt-tolerance MS` | 0.15 | gap that separates path levels |
 | `--keep K` | 1 | flows to keep per protocol in roulette |
 | `--hold SEC` | until Ctrl+C | roulette hold duration |
+| `--reroll` | | roulette: replace a degraded held flow from a fresh batch |
+| `--reroll-threshold MS` | 2.0 | window `rtt_min` above baseline by more than this = degraded |
+| `--reroll-windows N` | 2 | degraded windows in a row that trigger a re-roll |
 | `--series SEC` | 0 | per-window latency line |
 | `--progress N` | 100 / 0 | client progress every N replies; server rx line (0 off) |
 | `-v` | | print every verified reply |
