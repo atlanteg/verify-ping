@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0

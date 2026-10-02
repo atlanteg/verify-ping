@@ -32,7 +32,7 @@ One Python file, no dependencies, Linux or macOS, Python 3.9+.
 On **every** host involved (clients and servers), the same release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/atlanteg/verify-ping/v0.15.1/verify_ping.py -o verify_ping.py.tmp \
+curl -fsSL https://raw.githubusercontent.com/atlanteg/verify-ping/v0.16.1/verify_ping.py -o verify_ping.py.tmp \
   && mv verify_ping.py.tmp verify_ping.py && python3 verify_ping.py --version
 ```
 
@@ -120,7 +120,7 @@ Output, section by section:
 --- 10.0.0.1:20100..20103 verified udp statistics ---
 streams=4 count_per_stream=3000 sent=12000 verified=11968 lost=32 bad_payload=0 loss=0.267% duplicates=0 unexpected=0
 checked_payload=5.7MB elapsed=304.1s
-server version 0.15.1 (same as client)
+server version 0.16.1 (same as client)
 stream=1 sent=3000 verified=2990 lost=10 loss=0.333% bad_payload=0
 ...
 missing request indexes: 1:44, 1:94, 2:109, ...
@@ -176,7 +176,7 @@ sudo python3 verify_ping.py --server --protocol all --port 20100 -P 8
 - The log names the protocol on every line and announces each run:
 
 ```text
-verify_ping v0.15.1 server: udp, tcp, tcp-stream, icmp on port(s) 20100..20107
+verify_ping v0.16.1 server: udp, tcp, tcp-stream, icmp on port(s) 20100..20107
 [14:02:10] udp: test traffic from 10.0.0.7 started
 [14:02:11] udp: rx=50 pkt/s streams=4 clients=1 total=50
 [14:02:13] udp: finished, 100 packets over 4 stream(s) from 10.0.0.7
@@ -396,7 +396,7 @@ including Ethernet/IP/transport overhead, per protocol and phase, with the
 peak for sequential phases or the sum for concurrent roulettes — and waits:
 
 ```text
-verify_ping v0.15.1 load estimate (per direction; the echo adds the same the other way):
+verify_ping v0.16.1 load estimate (per direction; the echo adds the same the other way):
   udp roulette, probing 100 flows                  500.0 pkt/s     2.17 Mbit/s
   udp roulette, holding 1 flow(s)                    5.0 pkt/s    21.68 kbit/s
   tcp roulette, probing 100 flows                  500.0 pkt/s     2.23 Mbit/s
@@ -411,8 +411,29 @@ Ctrl+C there aborts with nothing sent. `-y` skips the question (scripts);
 so does a non-terminal stdin, with a note.
 
 Rough sizing: `pkt/s = flows / interval`; `bit/s ≈ pkt/s × (size + 42) × 8`.
-Lower the load with a larger `-i` or smaller `-s` rather than fewer probes —
-loss resolution is 1/probes.
+
+**Loss tests need many probes** — resolution is 1/probes — so lower their
+load with a larger `-i` or a smaller `-s`, not with fewer probes.
+
+**Latency work (hunt, roulette, pinned flows) does not**: it needs a solid
+*minimum* per flow, which 10–15 probes give, and packet size and rate are
+irrelevant to it. Light settings — 100-byte payload, one probe per second
+per flow — cut the load by 20× with no loss of information:
+
+```sh
+# roulette with re-roll: ~100 pkt/s (115 kbit/s) per protocol for 15 s per round, 1 pkt/s while holding
+sudo python3 verify_ping.py 10.0.0.1 --roulette 100 --port 20100 -P 8 -c 15 -i 1 -s 100 --hold 7200 --series 60 --reroll
+
+# path hunt, all protocols: ~64 pkt/s (73 kbit/s) per protocol for 18 s each
+sudo python3 verify_ping.py 10.0.0.1 --protocol all --port 20100 -P 8 --hunt 64 -c 15 -i 1 -s 100
+
+# watch one pinned flow for an hour at 1 pkt/s
+python3 verify_ping.py 10.0.0.1 --protocol tcp-stream --port 20103 -P 1 --src-port 43438 -c 3600 -i 1 -s 100 --series 60
+```
+
+With 15 probes a flow's minimum may sit 0.1–0.3 ms above its true floor
+(queueing); the `within 0.5 ms of the best` line absorbs that, and `-c 30`
+sharpens it if needed.
 
 ## 12. Troubleshooting
 
