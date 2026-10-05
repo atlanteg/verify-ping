@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.2"
+__version__ = "0.16.3"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1437,6 +1437,18 @@ def oneway_absolute(streams):
     return fwd, rev
 
 
+def oneway_sanity(fwd_abs_min, rev_abs_min, bound_us):
+    """Absolute one-way delays must lie in [-bound, rtt+bound]; a negative one
+    proves the clocks disagree more than they admit. Returns the minimum
+    disagreement in ms (0.0 when consistent)."""
+    bound_ns = (bound_us or 0) * 1000
+    worst = 0
+    for value in (fwd_abs_min, rev_abs_min):
+        if value is not None and value < -bound_ns:
+            worst = max(worst, -value - bound_ns)
+    return worst / 1e6
+
+
 def clock_verdict(args, client, server, rtt_ns=None):
     """(bound_us or None, explanation) for printing absolute one-way delays.
 
@@ -1483,6 +1495,12 @@ def print_oneway_stats(args, streams, server_clock):
     rtts = [item[0] for stream in streams for item in stream["lat"]]
     bound, verdict = clock_verdict(args, client, server_clock, min(rtts) if rtts else None)
     fmin, fp50, rmin, rp50 = min(fwd), percentile(fwd, 0.5), min(rev), percentile(rev, 0.5)
+    if bound is not None:
+        disagree = oneway_sanity(fmin, rmin, bound)
+        if disagree:
+            verdict = (f"a one-way delay is negative, so the clocks disagree by at least {disagree:.1f} ms "
+                       f"more than they report; check chronyc tracking / sources")
+            bound = None
     if bound is None and not args.wallclock:
         print(f"absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
         return
@@ -1492,12 +1510,6 @@ def print_oneway_stats(args, streams, server_clock):
         f"reverse (server -> client): min {ms(rmin)} ms p50 {ms(rp50)} ms  ({tag})"
     )
     print(f"asymmetry (forward - reverse, by minima): {ms(fmin - rmin)} ms")
-    if bound is not None and (fmin < -bound * 1000 or rmin < -bound * 1000):
-        off = max(-fmin, -rmin) / 1e6 - bound / 1000
-        print(
-            f"WARNING: a one-way delay is negative beyond the claimed clock error; the clocks "
-            f"disagree by at least {off:.3f} ms more than reported -- treat them as unsynced"
-        )
 
 
 def directional_summary(stream, server_log):
@@ -1821,6 +1833,12 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
         print(f"  clocks: client {describe_clock(client)}; server "
               f"{describe_clock(server_clock) if server_clock else 'unknown (not reported)'}")
         abs_rows = [row for row in answered if row["fwd_abs_min"] is not None and row["rev_abs_min"] is not None]
+        if abs_rows and bound is not None:
+            disagree = max(oneway_sanity(row["fwd_abs_min"], row["rev_abs_min"], bound) for row in abs_rows)
+            if disagree:
+                verdict = (f"UNVERIFIED: a one-way delay is negative, so the clocks disagree by at least "
+                           f"{disagree:.1f} ms more than they report")
+                bound = None
         if abs_rows and (bound is not None or args.wallclock):
             best_f = min(abs_rows, key=lambda row: row["fwd_abs_min"])
             best_r = min(abs_rows, key=lambda row: row["rev_abs_min"])
@@ -1830,10 +1848,6 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
                 f"(flow {best_f['stream']}), best reverse {ms(best_r['rev_abs_min'])} ms "
                 f"(flow {best_r['stream']}), asymmetry {ms(best_f['fwd_abs_min'] - best_r['rev_abs_min'])} ms"
             )
-            if bound is not None and (
-                best_f["fwd_abs_min"] < -bound * 1000 or best_r["rev_abs_min"] < -bound * 1000
-            ):
-                print("  WARNING: negative one-way delay beyond the claimed clock error; treat clocks as unsynced")
         elif abs_rows:
             print(f"  absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
     else:
@@ -1930,6 +1944,8 @@ class SeriesReporter:
         line = f"{self.label}[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
         if fwd:
             line += f" | fwd min {ms(min(fwd))} | rev min {ms(min(rev))} ms"
+            if min(rev) < 0 or min(fwd) < 0:
+                line += " (clock offset, not absolute)"
         line += f"  ({len(rtts)}/{sent_window} replies)"
         print(line, flush=True)
 
@@ -2510,6 +2526,12 @@ def roulette_round(args, dest_ip, transport, protocol, label, round_no):
     rev_best = min(row["rev_min"] for row in answered)
     fwd_best = min(row["fwd_min"] for row in answered)
     bound, verdict = clock_verdict(args, client_clock, server_clock, answered[0]["rtt_min"])
+    if bound is not None:
+        disagree = max(oneway_sanity(row["fwd_abs_min"], row["rev_abs_min"], bound) for row in answered)
+        if disagree:
+            verdict = (f"UNVERIFIED: a one-way delay is negative, so the clocks disagree by at least "
+                       f"{disagree:.1f} ms more than they report; check chronyc tracking / sources")
+            bound = None
     tol = int(args.hunt_tolerance * 1e6)
 
     if round_no == 0:
@@ -2537,7 +2559,7 @@ def roulette_round(args, dest_ip, transport, protocol, label, round_no):
     print(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
     print(near_best_line(answered, label))
-    if round_no == 0:
+    if round_no == 0 or bound is None:
         print(f"{label}clocks: client {describe_clock(client_clock)}; server "
               f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
               f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")

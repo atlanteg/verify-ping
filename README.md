@@ -377,7 +377,11 @@ that itself rather than trusting you:
   larger than the delays being measured` — and `--wallclock` prints the
   figures anyway, marked UNVERIFIED.
 - A one-way delay that comes out negative beyond the claimed error proves
-  the clocks disagree more than they admit, and the tool says so.
+  the clocks disagree more than they admit. The tool then withdraws the
+  absolute figures everywhere (one-way block, hunt, roulette columns) and
+  names the minimum disagreement — a daemon can report ±0.1 ms while being
+  16 ms off; check `chronyc tracking` and `chronyc sources -v` on that host.
+  `--series` lines mark such values as `(clock offset, not absolute)`.
 
 What is "synced enough": NTP over the internet gives 1–10 ms (too coarse
 for sub‑millisecond asymmetry); chrony against a nearby stratum‑1, or a
