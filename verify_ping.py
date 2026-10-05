@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.1"
+__version__ = "0.16.2"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2730,7 +2730,9 @@ def run_roulettes(args, dest_ip):
             print(f"{label}crashed: {exc!r}")
             codes[protocol] = 1
 
-    threads = [threading.Thread(target=runner, args=(protocol,), daemon=True, name=protocol)
+    # Not daemon threads: a daemon still printing while the interpreter
+    # shuts down dies with "could not acquire lock for stdout".
+    threads = [threading.Thread(target=runner, args=(protocol,), name=protocol)
                for protocol in args.protocols]
     for thread in threads:
         thread.start()
@@ -2739,10 +2741,14 @@ def run_roulettes(args, dest_ip):
             for thread in threads:
                 thread.join(0.5)
     except KeyboardInterrupt:
-        print("\nstopping all roulettes")
+        print("\nstopping all roulettes (summaries follow; Ctrl+C again to quit at once)", flush=True)
         STOP.set()
-        for thread in threads:
-            thread.join(10)
+        try:
+            for thread in threads:
+                thread.join(30)
+        except KeyboardInterrupt:
+            sys.stdout.flush()
+            os._exit(130)
     return max(codes.values()) if codes else 1
 
 
