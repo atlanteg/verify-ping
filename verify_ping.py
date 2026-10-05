@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.4"
+__version__ = "0.16.5"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -2549,35 +2549,39 @@ def roulette_round(args, dest_ip, transport, protocol, label, round_no):
             bound = None
     tol = int(args.hunt_tolerance * 1e6)
 
+    # The udp and tcp roulettes report at the same moment from two threads;
+    # one write per report keeps the tables from interleaving line by line.
+    out = []
     if round_no == 0:
-        print()
-        print(f"{label}--- roulette {transport['name']}: {len(answered)} flows ranked by forward + reverse minima ---")
-        print(f"{label}{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
+        out.append("")
+        out.append(f"{label}--- roulette {transport['name']}: {len(answered)} flows ranked by forward + reverse minima ---")
+        out.append(f"{label}{'rank':>4} {'flow':>4} {'src->dst':<14} {'rtt_min':>9} {'rev_rel':>9} {'fwd_rel':>9}"
               + (f" {'rev_abs':>9} {'fwd_abs':>9}" if bound is not None else ""))
         for index, row in enumerate(answered[:10], 1):
             line = (f"{label}{index:>4} {row['stream']:>4} {flow_label(protocol, row):<14} {ms(row['rtt_min']):>9} "
                     f"{'+' + ms(row['rev_min'] - rev_best):>9} {'+' + ms(row['fwd_min'] - fwd_best):>9}")
             if bound is not None:
                 line += f" {ms(row['rev_abs_min']):>9} {ms(row['fwd_abs_min']):>9}"
-            print(line)
+            out.append(line)
         if len(answered) > 10:
-            print(f"{label}  ... {len(answered) - 10} more")
+            out.append(f"{label}  ... {len(answered) - 10} more")
     fastest = {}
     for name, key in (("forward", "fwd_min"), ("reverse", "rev_min")):
         groups = group_paths(answered, key, tol)
         fastest[key] = {row["stream"] for row in groups[0]["rows"]}
         fast = len(groups[0]["rows"])
-        print(f"{label}{name} levels: {levels_phrase(groups, tol)}; "
+        out.append(f"{label}{name} levels: {levels_phrase(groups, tol)}; "
               f"{fast} of {len(answered)} flows ({100.0 * fast / len(answered):.1f}%) on the fastest")
     both = [row for row in answered
             if row["stream"] in fastest["fwd_min"] and row["stream"] in fastest["rev_min"]]
-    print(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
+    out.append(f"{label}fast in both directions: {len(both)} of {len(answered)} flows"
           + (f" (flows {[row['stream'] for row in both[:10]]}{'...' if len(both) > 10 else ''})" if both else ""))
-    print(near_best_line(answered, label))
+    out.append(near_best_line(answered, label))
     if round_no == 0 or bound is None:
-        print(f"{label}clocks: client {describe_clock(client_clock)}; server "
+        out.append(f"{label}clocks: client {describe_clock(client_clock)}; server "
               f"{describe_clock(server_clock) if server_clock else 'unknown'} -> one-way "
               f"{'absolute, ' + verdict if bound is not None else 'relative only (' + verdict + ')'}")
+    print("\n".join(out), flush=True)
     return {
         "streams": streams, "answered": answered, "state": state, "selector": selector,
         "socket_to_stream": socket_to_stream, "bound": bound, "verdict": verdict,
