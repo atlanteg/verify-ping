@@ -383,6 +383,20 @@ that itself rather than trusting you:
   names the minimum disagreement — a daemon can report ±0.1 ms while being
   16 ms off; check `chronyc tracking` and `chronyc sources -v` on that host.
   `--series` lines mark such values as `(clock offset, not absolute)`.
+- On a virtual machine the reported error is relative to the hypervisor's
+  clock (`PHC0` / `/dev/ptp_hyperv`, Amazon Time Sync), not to UTC: a VM
+  following a host that is 16 ms off reports ±5 µs. To check a host against
+  the outside world without changing its sync, add measurement-only sources
+  and read them after a few minutes:
+
+      sudo chronyc add server time.google.com iburst noselect
+      sudo chronyc add server time.cloudflare.com iburst noselect
+      sleep 600; chronyc sources -v; chronyc sourcestats -v
+      sudo chronyc delete time.google.com; sudo chronyc delete time.cloudflare.com
+
+  Milliseconds in their `Last sample` / `Offset` columns while the reference
+  clock claims microseconds means the host clock is wrong (redeploy the VM
+  to another host, or stop trusting the reference clock alone).
 
 What is "synced enough": NTP over the internet gives 1–10 ms (too coarse
 for sub‑millisecond asymmetry); chrony against a nearby stratum‑1, or a
