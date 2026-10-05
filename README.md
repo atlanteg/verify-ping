@@ -376,7 +376,8 @@ that itself rather than trusting you:
   provide one, systemd-timesyncd does not)`, `clock error bound ±966 ms is
   larger than the delays being measured` — and `--wallclock` prints the
   figures anyway, marked UNVERIFIED.
-- A one-way delay that comes out negative beyond the claimed error proves
+- A one-way delay that comes out negative, or a direction below 20% of the
+  round trip (0.6 ms back on a 32 ms path), is not believable and proves
   the clocks disagree more than they admit. The tool then withdraws the
   absolute figures everywhere (one-way block, hunt, roulette columns) and
   names the minimum disagreement — a daemon can report ±0.1 ms while being

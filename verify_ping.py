@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.3"
+__version__ = "0.16.4"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -1437,15 +1437,28 @@ def oneway_absolute(streams):
     return fwd, rev
 
 
+ONEWAY_MIN_SHARE = 0.2  # a direction below this share of the round trip is not believable
+
+
 def oneway_sanity(fwd_abs_min, rev_abs_min, bound_us):
-    """Absolute one-way delays must lie in [-bound, rtt+bound]; a negative one
-    proves the clocks disagree more than they admit. Returns the minimum
-    disagreement in ms (0.0 when consistent)."""
+    """How far off the clocks must be, in ms, for these absolute one-way delays to be true.
+
+    Negative delays are impossible outright. A direction under 20% of the
+    round trip (0.6 ms back on a 32 ms path) is not believable either: real
+    paths are not that asymmetric, so the clocks are off by at least the
+    shortfall. Returns 0.0 when the figures are plausible.
+    """
     bound_ns = (bound_us or 0) * 1000
     worst = 0
-    for value in (fwd_abs_min, rev_abs_min):
-        if value is not None and value < -bound_ns:
-            worst = max(worst, -value - bound_ns)
+    if fwd_abs_min is not None and rev_abs_min is not None:
+        floor = (fwd_abs_min + rev_abs_min) * ONEWAY_MIN_SHARE
+        for value in (fwd_abs_min, rev_abs_min):
+            if value < floor - bound_ns:
+                worst = max(worst, floor - value - bound_ns)
+    else:
+        for value in (fwd_abs_min, rev_abs_min):
+            if value is not None and value < -bound_ns:
+                worst = max(worst, -value - bound_ns)
     return worst / 1e6
 
 
@@ -1498,8 +1511,9 @@ def print_oneway_stats(args, streams, server_clock):
     if bound is not None:
         disagree = oneway_sanity(fmin, rmin, bound)
         if disagree:
-            verdict = (f"a one-way delay is negative, so the clocks disagree by at least {disagree:.1f} ms "
-                       f"more than they report; check chronyc tracking / sources")
+            verdict = (f"one-way delays are not believable (a direction below {int(ONEWAY_MIN_SHARE * 100)}% of "
+                       f"the round trip): the clocks are off by at least {disagree:.1f} ms; check chronyc "
+                       f"tracking / sources on both hosts")
             bound = None
     if bound is None and not args.wallclock:
         print(f"absolute one-way delay withheld: {verdict}; pass --wallclock to print it anyway")
@@ -1836,8 +1850,8 @@ def print_hunt_report(args, streams, arrival_logs, server_clock=None):
         if abs_rows and bound is not None:
             disagree = max(oneway_sanity(row["fwd_abs_min"], row["rev_abs_min"], bound) for row in abs_rows)
             if disagree:
-                verdict = (f"UNVERIFIED: a one-way delay is negative, so the clocks disagree by at least "
-                           f"{disagree:.1f} ms more than they report")
+                verdict = (f"UNVERIFIED: one-way delays are not believable, the clocks are off by at least "
+                           f"{disagree:.1f} ms; check chronyc tracking / sources on both hosts")
                 bound = None
         if abs_rows and (bound is not None or args.wallclock):
             best_f = min(abs_rows, key=lambda row: row["fwd_abs_min"])
@@ -1944,7 +1958,7 @@ class SeriesReporter:
         line = f"{self.label}[{stamp}] rtt min {ms(min(rtts))} p50 {ms(percentile(rtts, 0.5))} ms"
         if fwd:
             line += f" | fwd min {ms(min(fwd))} | rev min {ms(min(rev))} ms"
-            if min(rev) < 0 or min(fwd) < 0:
+            if oneway_sanity(min(fwd), min(rev), 0):
                 line += " (clock offset, not absolute)"
         line += f"  ({len(rtts)}/{sent_window} replies)"
         print(line, flush=True)
@@ -2529,8 +2543,9 @@ def roulette_round(args, dest_ip, transport, protocol, label, round_no):
     if bound is not None:
         disagree = max(oneway_sanity(row["fwd_abs_min"], row["rev_abs_min"], bound) for row in answered)
         if disagree:
-            verdict = (f"UNVERIFIED: a one-way delay is negative, so the clocks disagree by at least "
-                       f"{disagree:.1f} ms more than they report; check chronyc tracking / sources")
+            verdict = (f"UNVERIFIED: one-way delays are not believable (a direction below "
+                       f"{int(ONEWAY_MIN_SHARE * 100)}% of the round trip), the clocks are off by at least "
+                       f"{disagree:.1f} ms; check chronyc tracking / sources on both hosts")
             bound = None
     tol = int(args.hunt_tolerance * 1e6)
 
