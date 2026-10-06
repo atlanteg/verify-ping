@@ -412,7 +412,8 @@ this.
 Before a client sends anything it prints the load the run will generate —
 packets/s and bit/s **per direction** (the echo mirrors it the other way),
 including Ethernet/IP/transport overhead, per protocol and phase, with the
-peak for sequential phases or the sum for concurrent roulettes — and waits:
+peak for sequential phases or the sum for concurrent roulettes — and the
+**expected total time** of everything requested, then waits:
 
 ```text
 verify_ping v0.16.1 load estimate (per direction; the echo adds the same the other way):
@@ -423,8 +424,15 @@ verify_ping v0.16.1 load estimate (per direction; the echo adds the same the oth
   all roulettes probing at once                   1000.0 pkt/s     4.40 Mbit/s
   all roulettes holding at once                     10.0 pkt/s    44.00 kbit/s
   probing takes ~9s, then holding 1800s
+  total time: ~30m09s (+ ~9s for every re-roll)
 Proceed? [Enter = yes, Ctrl+C = abort]
 ```
+
+For plain and hunt runs the protocols go one after another, so the total is
+`(count × interval + timeout) × protocols` (for example `-c 60 -i 1 --protocol
+all` is about 4m12s plus a few seconds per protocol to connect and fetch the
+server log). A roulette's total is the probing time plus `--hold`; each
+re-roll adds one more probing round.
 
 Ctrl+C there aborts with nothing sent. `-y` skips the question (scripts);
 so does a non-terminal stdin, with a note.

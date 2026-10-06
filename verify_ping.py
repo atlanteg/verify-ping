@@ -11,7 +11,7 @@ import threading
 import time
 
 
-__version__ = "0.16.5"
+__version__ = "0.16.6"
 VERSION_TUPLE = tuple(int(part) for part in __version__.split("."))
 
 ICMP_ECHO_REPLY = 0
@@ -3643,6 +3643,18 @@ def fmt_rate(bps):
     return f"{bps:.0f} bit/s"
 
 
+def fmt_duration(seconds):
+    """63 -> '1m03s', 4320 -> '1h12m00s', 12 -> '12s'."""
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def load_estimate(args):
     """[(label, flows, pps, bps)] per phase of the run, each per direction (the echo mirrors it)."""
     phases = []
@@ -3685,8 +3697,17 @@ def confirm_load(args):
     if args.roulette:
         print(f"  probing takes ~{duration:.0f}s, then holding "
               + (f"{args.hold:g}s" if args.hold else "until Ctrl+C"))
+        if args.hold:
+            print(f"  total time: ~{fmt_duration(duration + args.hold)}"
+                  + (f" (+ ~{duration:.0f}s for every re-roll)" if args.reroll else ""))
+        else:
+            print(f"  total time: until Ctrl+C (first ranking after ~{fmt_duration(duration)})")
     else:
         print(f"  each protocol runs ~{duration:.0f}s")
+        count = len(args.protocols)
+        print(f"  total time: ~{fmt_duration(duration * count)}"
+              + (f" ({count} protocols one after another)" if count > 1 else "")
+              + ", plus a few seconds per protocol to connect and fetch the server log")
     if args.yes:
         return
     if not sys.stdin.isatty():
